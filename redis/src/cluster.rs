@@ -127,12 +127,9 @@ pub struct ClusterConnection<C = Connection> {
     slots: RefCell<SlotMap>,
     auto_reconnect: RefCell<bool>,
     read_from_replicas: bool,
-    username: Option<String>,
-    password: Option<String>,
     read_timeout: RefCell<Option<Duration>>,
     write_timeout: RefCell<Option<Duration>>,
-    tls: Option<TlsMode>,
-    retries: u32,
+    cluster_params: ClusterParams,
 }
 
 impl<C> ClusterConnection<C>
@@ -148,13 +145,10 @@ where
             slots: RefCell::new(SlotMap::new()),
             auto_reconnect: RefCell::new(true),
             read_from_replicas: cluster_params.read_from_replicas,
-            username: cluster_params.username,
-            password: cluster_params.password,
+            cluster_params,
             read_timeout: RefCell::new(None),
             write_timeout: RefCell::new(None),
-            tls: cluster_params.tls,
             initial_nodes: initial_nodes.to_vec(),
-            retries: cluster_params.retries,
         };
         connection.create_initial_connections()?;
 
@@ -299,7 +293,7 @@ where
 
         for conn in samples.iter_mut() {
             let value = conn.req_command(&slot_cmd())?;
-            if let Ok(mut slots_data) = parse_slots(value, self.tls) {
+            if let Ok(mut slots_data) = parse_slots(value, self.cluster_params.tls) {
                 slots_data.sort_by_key(|s| s.start());
                 let last_slot = slots_data.iter().try_fold(0, |prev_end, slot_data| {
                     if prev_end != slot_data.start() {
@@ -341,13 +335,7 @@ where
     }
 
     fn connect(&self, node: &str) -> RedisResult<C> {
-        let params = ClusterParams {
-            password: self.password.clone(),
-            username: self.username.clone(),
-            tls: self.tls,
-            ..Default::default()
-        };
-        let info = get_connection_info(node, params)?;
+        let info = get_connection_info(node, self.cluster_params.clone())?;
 
         let mut conn = C::connect(info, None)?;
         if self.read_from_replicas {
@@ -469,7 +457,7 @@ where
             None => fail!(UNROUTABLE_ERROR),
         };
 
-        let mut retries = self.retries;
+        let mut retries = self.cluster_params.retries;
         let mut redirected = None::<Redirect>;
 
         loop {
