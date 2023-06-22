@@ -49,6 +49,7 @@ use futures::{
     prelude::*,
     ready, stream,
 };
+use futures_time::future::FutureExt;
 use log::trace;
 use pin_project_lite::pin_project;
 use rand::{seq::IteratorRandom, thread_rng};
@@ -730,7 +731,7 @@ where
     ) -> RedisResult<C> {
         if let Some(conn) = conn_option {
             let mut conn = conn.await;
-            match check_connection(&mut conn).await {
+            match check_connection(&mut conn, params.connection_timeout.into()).await {
                 Ok(_) => Ok(conn),
                 Err(_) => connect_and_check(addr, params.clone()).await,
             }
@@ -1000,9 +1001,10 @@ where
     C: ConnectionLike + Connect + Send + 'static,
 {
     let read_from_replicas = params.read_from_replicas;
+    let connection_timeout = params.connection_timeout.into();
     let info = get_connection_info(node, params)?;
-    let mut conn = C::connect(info).await?;
-    check_connection(&mut conn).await?;
+    let mut conn: C = C::connect(info).timeout(connection_timeout).await??;
+    check_connection(&mut conn, connection_timeout).await?;
     if read_from_replicas {
         // If READONLY is sent to primary nodes, it will have no effect
         crate::cmd("READONLY").query_async(&mut conn).await?;
@@ -1010,13 +1012,14 @@ where
     Ok(conn)
 }
 
-async fn check_connection<C>(conn: &mut C) -> RedisResult<()>
+async fn check_connection<C>(conn: &mut C, timeout: futures_time::time::Duration) -> RedisResult<()>
 where
     C: ConnectionLike + Send + 'static,
 {
-    let mut cmd = Cmd::new();
-    cmd.arg("PING");
-    cmd.query_async::<_, String>(conn).await?;
+    crate::cmd("PING")
+        .query_async::<_, String>(conn)
+        .timeout(timeout)
+        .await??;
     Ok(())
 }
 
