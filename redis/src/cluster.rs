@@ -923,9 +923,9 @@ pub(crate) fn calculate_topology(
     let mut max_heap: std::collections::BinaryHeap<TopologyView> =
         hash_view_map.drain().map(|(_key, value)| value).collect();
     let most_frequent_topology = max_heap.pop().unwrap();
-    let has_more_than_a_single_max = max_heap
-        .peek()
-        .is_some_and(|view| view.nodes_count == most_frequent_topology.nodes_count);
+    let second_most_frequent_topology = max_heap.peek();
+    let has_more_than_a_single_max = second_most_frequent_topology.is_some()
+        && second_most_frequent_topology.unwrap().nodes_count == most_frequent_topology.nodes_count;
     if has_more_than_a_single_max {
         // More than a single most frequent view was found.
         if (retries.is_some() && retries.unwrap().fetch_sub(1, atomic::Ordering::SeqCst) == 1)
