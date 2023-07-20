@@ -510,10 +510,12 @@ fn test_async_cluster_move_error_refresh_topology(
             _ => {
                 if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
                     let num_of_view = slots_config_vec.len();
-                    let port_index = ports.iter().position(|&p| p == port).expect(&format!(
-                        "CLUSTER SLOTS was called with unknown port: {port}; Known ports: {:?}",
-                        ports
-                    ));
+                    let port_index = ports.iter().position(|&p| p == port).unwrap_or_else(|| {
+                        panic!(
+                            "CLUSTER SLOTS was called with unknown port: {port}; Known ports: {:?}",
+                            ports
+                        )
+                    });
                     // If we have less views than nodes, use the last view
                     let view_index = if port_index < num_of_view {
                         port_index
@@ -528,10 +530,10 @@ fn test_async_cluster_move_error_refresh_topology(
                             .unwrap()
                             .swap(true, Ordering::SeqCst));
                     }
-                    return Err(Ok(create_topology_from_config(
+                    Err(Ok(create_topology_from_config(
                         name,
                         slots_config_vec[view_index].clone(),
-                    )));
+                    )))
                 } else {
                     assert_eq!(port, moved_node);
                     assert!(is_get_cmd, "{:?}", std::str::from_utf8(cmd));
@@ -556,7 +558,6 @@ fn test_async_cluster_client_initialization_refresh_topology(
 ) {
     assert!(!ports.is_empty() && !slots_config_vec.is_empty());
     let name = "refresh_topology_client_init";
-    let requests = atomic::AtomicUsize::new(0);
     let started = atomic::AtomicBool::new(false);
     let MockEnv {
         runtime,
@@ -578,10 +579,12 @@ fn test_async_cluster_client_initialization_refresh_topology(
                     return Err(Ok(Value::Status("OK".into())));
                 } else if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
                     let num_of_view = slots_config_vec.len();
-                    let port_index = ports.iter().position(|&p| p == port).expect(&format!(
-                        "CLUSTER SLOTS was called with unknown port: {port}; Known ports: {:?}",
-                        ports
-                    ));
+                    let port_index = ports.iter().position(|&p| p == port).unwrap_or_else(|| {
+                        panic!(
+                            "CLUSTER SLOTS was called with unknown port: {port}; Known ports: {:?}",
+                            ports
+                        )
+                    });
                     // If we have less views than nodes, use the last view
                     let view_index = if port_index < num_of_view {
                         port_index
@@ -602,14 +605,11 @@ fn test_async_cluster_client_initialization_refresh_topology(
                 return Err(Ok(Value::Status("OK".into())));
             }
 
-            let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
             let is_get_cmd = contains_slice(cmd, b"GET");
             let get_response = Err(Ok(Value::Data(b"123".to_vec())));
-            match i {
-                _ => {
-                    assert!(is_get_cmd, "{:?}", std::str::from_utf8(cmd));
-                    get_response
-                }
+            {
+                assert!(is_get_cmd, "{:?}", std::str::from_utf8(cmd));
+                get_response
             }
         },
     );
@@ -636,7 +636,7 @@ fn generate_topology_view(
             start_pos + interval
         };
         let mock_slot = MockSlotRange {
-            primary_port: *port as u16,
+            primary_port: *port,
             replica_ports: vec![],
             slot_range: (start_pos as u16..end_pos as u16),
         };
@@ -647,7 +647,7 @@ fn generate_topology_view(
 }
 
 fn get_ports(num_of_nodes: usize) -> Vec<u16> {
-    (6379 as u16..6379 + num_of_nodes as u16).collect()
+    (6379_u16..6379 + num_of_nodes as u16).collect()
 }
 
 fn get_no_majority_topology_view(ports: &Vec<u16>) -> Vec<Vec<MockSlotRange>> {

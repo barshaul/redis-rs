@@ -740,7 +740,7 @@ pub(crate) fn parse_slots(raw_slot_resp: &Value, tls: Option<TlsMode>) -> RedisR
     let mut result = Vec::with_capacity(2);
 
     if let Value::Bulk(items) = raw_slot_resp {
-        let mut iter = items.into_iter();
+        let mut iter = items.iter();
         while let Some(Value::Bulk(item)) = iter.next() {
             if item.len() < 3 {
                 continue;
@@ -759,7 +759,7 @@ pub(crate) fn parse_slots(raw_slot_resp: &Value, tls: Option<TlsMode>) -> RedisR
             };
 
             let mut nodes: Vec<String> = item
-                .into_iter()
+                .iter()
                 .skip(2)
                 .filter_map(|node| {
                     if let Value::Bulk(node) = node {
@@ -916,7 +916,7 @@ pub(crate) fn calculate_topology(
         let err = Err(RedisError::from((
             ErrorKind::ResponseError,
             "Slot refresh error.",
-            format!("All CLUSTER SLOTS results are errors"),
+            "All CLUSTER SLOTS results are errors".to_string(),
         )));
         return err;
     }
@@ -939,7 +939,7 @@ pub(crate) fn calculate_topology(
         let err = Err(RedisError::from((
             ErrorKind::ResponseError,
             "Slot refresh error.",
-            format!("Couldn't get a majority in topology views"),
+            "Couldn't get a majority in topology views".to_string(),
         )));
         return err;
     }
@@ -950,7 +950,7 @@ pub(crate) fn calculate_topology(
         Err(RedisError::from((
             ErrorKind::ResponseError,
             "Slot refresh error.",
-            format!("The accuracy of the topology view is too low"),
+            "The accuracy of the topology view is too low".to_string(),
         )))
     }
 }

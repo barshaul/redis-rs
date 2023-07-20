@@ -588,10 +588,7 @@ where
                     }
                 }
             }
-            let connections: &HashMap<
-                String,
-                future::Shared<Pin<Box<dyn Future<Output = C> + Send>>>,
-            > = &read_guard.0;
+            let connections: &ConnectionMap<C> = &read_guard.0;
             let mut nodes = slots.values().flatten().collect::<Vec<_>>();
             nodes.sort_unstable();
             nodes.dedup();
