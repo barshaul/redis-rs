@@ -36,8 +36,12 @@
 //!     .query(&mut connection).unwrap();
 //! ```
 use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::iter::Iterator;
 use std::str::FromStr;
+use std::sync::{atomic, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -681,6 +685,31 @@ impl NodeCmd {
     }
 }
 
+#[derive(Debug, Eq)]
+pub(crate) struct TopologyView {
+    pub(crate) hash_value: u64,
+    pub(crate) topology_value: Value,
+    pub(crate) nodes_count: u16,
+}
+
+impl PartialOrd for TopologyView {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.nodes_count.partial_cmp(&other.nodes_count)
+    }
+}
+
+impl Ord for TopologyView {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.nodes_count.cmp(&other.nodes_count)
+    }
+}
+
+impl PartialEq for TopologyView {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash_value == other.hash_value
+    }
+}
+
 /// TlsMode indicates use or do not use verification of certification.
 /// Check [ConnectionAddr](ConnectionAddr::TcpTls::insecure) for more.
 #[derive(Clone, Copy)]
@@ -706,7 +735,7 @@ fn get_random_connection<C: ConnectionLike + Connect + Sized>(
 }
 
 // Parse slot data from raw redis value.
-pub(crate) fn parse_slots(raw_slot_resp: Value, tls: Option<TlsMode>) -> RedisResult<Vec<Slot>> {
+pub(crate) fn parse_slots(raw_slot_resp: &Value, tls: Option<TlsMode>) -> RedisResult<Vec<Slot>> {
     // Parse response.
     let mut result = Vec::with_capacity(2);
 
@@ -856,6 +885,76 @@ pub(crate) fn slot_cmd() -> Cmd {
     cmd
 }
 
+fn calculate_hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+
+pub(crate) fn calculate_topology(
+    topology_results: Vec<Result<Value, RedisError>>,
+    retries: Option<Arc<atomic::AtomicUsize>>,
+) -> Result<Vec<TopologyView>, RedisError> {
+    assert!(!topology_results.is_empty());
+    const MIN_ACCURACY_RATE: f32 = 0.2;
+    let num_of_nodes = topology_results.len();
+    let mut hash_view_map = HashMap::new();
+    for view_result in topology_results {
+        if view_result.is_err() {
+            continue;
+        }
+        let view = view_result.unwrap();
+        let hash_value = calculate_hash(&view);
+        let topology_entry = hash_view_map.entry(hash_value).or_insert(TopologyView {
+            hash_value,
+            topology_value: view,
+            nodes_count: 0,
+        });
+        topology_entry.nodes_count += 1;
+    }
+    if hash_view_map.is_empty() {
+        let err = Err(RedisError::from((
+            ErrorKind::ResponseError,
+            "Slot refresh error.",
+            format!("All CLUSTER SLOTS results are errors"),
+        )));
+        return err;
+    }
+    let mut max_heap: std::collections::BinaryHeap<TopologyView> =
+        hash_view_map.drain().map(|(_key, value)| value).collect();
+    let most_frequent_topology = max_heap.pop().unwrap();
+    let has_more_than_a_single_max = max_heap
+        .peek()
+        .is_some_and(|view| view.nodes_count == most_frequent_topology.nodes_count);
+    if has_more_than_a_single_max {
+        // More than a single most frequent view was found.
+        if (retries.is_some() && retries.unwrap().fetch_sub(1, atomic::Ordering::SeqCst) == 1)
+            || num_of_nodes < 3
+        {
+            // If it's the last retry, or if we it's a 2-nodes cluster, we'll return all found topologies to be checked by the caller
+            let mut topology_vec = max_heap.into_vec();
+            topology_vec.push(most_frequent_topology);
+            return Ok(topology_vec);
+        }
+        let err = Err(RedisError::from((
+            ErrorKind::ResponseError,
+            "Slot refresh error.",
+            format!("Couldn't get a majority in topology views"),
+        )));
+        return err;
+    }
+    let accuracy_num = most_frequent_topology.nodes_count as f32 / num_of_nodes as f32;
+    if accuracy_num >= MIN_ACCURACY_RATE {
+        Ok(vec![most_frequent_topology])
+    } else {
+        Err(RedisError::from((
+            ErrorKind::ResponseError,
+            "Slot refresh error.",
+            format!("The accuracy of the topology view is too low"),
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,5 +996,51 @@ mod tests {
                 ))),
             );
         }
+    }
+
+    #[test]
+    fn test_topology_calculator() {
+        let err = RedisError::from((ErrorKind::ResponseError, "parse error"));
+
+        // majority
+        let topology_results = vec![
+            Ok(Value::Status("view1".to_string())),
+            Ok(Value::Status("view1".to_string())),
+            Ok(Value::Status("view2".to_string())),
+            Err(err),
+        ];
+        let topology_view = calculate_topology(topology_results, None);
+        assert_eq!(
+            topology_view.unwrap()[0].topology_value,
+            Value::Status("view1".to_string())
+        );
+
+        // no majority
+        let topology_results = vec![
+            Ok(Value::Status("view1".to_string())),
+            Ok(Value::Status("view2".to_string())),
+            Ok(Value::Status("view3".to_string())),
+        ];
+        let topology_view = calculate_topology(topology_results, None);
+        assert!(topology_view.is_err());
+
+        // 2 nodes no majority
+        let topology_results = vec![
+            Ok(Value::Status("view1".to_string())),
+            Ok(Value::Status("view2".to_string())),
+        ];
+        let topology_view = calculate_topology(topology_results, None).unwrap();
+        let res: Vec<_> = topology_view.iter().map(|t| &t.topology_value).collect();
+        assert!(res.contains(&&Value::Status("view1".to_string())));
+        assert!(res.contains(&&Value::Status("view2".to_string())));
+
+        // 2 nodes 1 error
+        let err = RedisError::from((ErrorKind::ResponseError, "parse error"));
+        let topology_results = vec![Ok(Value::Status("view1".to_string())), Err(err)];
+        let topology_view = calculate_topology(topology_results, None);
+        assert_eq!(
+            topology_view.unwrap()[0].topology_value,
+            Value::Status("view1".to_string())
+        );
     }
 }
