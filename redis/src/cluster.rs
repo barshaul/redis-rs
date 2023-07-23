@@ -36,7 +36,6 @@
 //!     .query(&mut connection).unwrap();
 //! ```
 use std::cell::RefCell;
-use std::cmp::Ordering;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::iter::Iterator;
@@ -45,6 +44,7 @@ use std::sync::{atomic, Arc};
 use std::thread;
 use std::time::Duration;
 
+use derivative::Derivative;
 use log::trace;
 use rand::{seq::IteratorRandom, thread_rng, Rng};
 
@@ -685,29 +685,16 @@ impl NodeCmd {
     }
 }
 
+#[derive(Derivative)]
+#[derivative(PartialEq, PartialOrd, Ord)]
 #[derive(Debug, Eq)]
 pub(crate) struct TopologyView {
+    #[derivative(PartialOrd = "ignore", Ord = "ignore")]
     pub(crate) hash_value: u64,
+    #[derivative(PartialEq = "ignore", PartialOrd = "ignore", Ord = "ignore")]
     pub(crate) topology_value: Value,
+    #[derivative(PartialEq = "ignore")]
     pub(crate) nodes_count: u16,
-}
-
-impl PartialOrd for TopologyView {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.nodes_count.partial_cmp(&other.nodes_count)
-    }
-}
-
-impl Ord for TopologyView {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.nodes_count.cmp(&other.nodes_count)
-    }
-}
-
-impl PartialEq for TopologyView {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash_value == other.hash_value
-    }
 }
 
 /// TlsMode indicates use or do not use verification of certification.
