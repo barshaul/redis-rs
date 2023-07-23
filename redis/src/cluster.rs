@@ -881,16 +881,20 @@ fn calculate_hash<T: Hash>(t: &T) -> u64 {
 pub(crate) fn calculate_topology(
     topology_results: Vec<Result<Value, RedisError>>,
     retries: Option<Arc<atomic::AtomicUsize>>,
-) -> Result<Vec<TopologyView>, RedisError> {
+    tls_mode: Option<TlsMode>,
+    read_from_replicas: bool,
+) -> Result<SlotMap, RedisError> {
     assert!(!topology_results.is_empty());
     const MIN_ACCURACY_RATE: f32 = 0.2;
     let num_of_nodes = topology_results.len();
     let mut hash_view_map = HashMap::new();
     for view_result in topology_results {
-        if view_result.is_err() {
-            continue;
-        }
-        let view = view_result.unwrap();
+        let view = match view_result {
+            Ok(view) => view,
+            Err(_) => {
+                continue;
+            }
+        };
         let hash_value = calculate_hash(&view);
         let topology_entry = hash_view_map.entry(hash_value).or_insert(TopologyView {
             hash_value,
@@ -900,50 +904,87 @@ pub(crate) fn calculate_topology(
         topology_entry.nodes_count += 1;
     }
     if hash_view_map.is_empty() {
-        let err = Err(RedisError::from((
+        return Err(RedisError::from((
             ErrorKind::ResponseError,
-            "Slot refresh error.",
-            "All CLUSTER SLOTS results are errors".to_string(),
+            "Slot refresh error: All CLUSTER SLOTS results are errors",
         )));
-        return err;
     }
-    let mut max_heap: std::collections::BinaryHeap<TopologyView> =
-        hash_view_map.drain().map(|(_key, value)| value).collect();
-    let most_frequent_topology = max_heap.pop().unwrap();
-    let second_most_frequent_topology = max_heap.peek();
-    let has_more_than_a_single_max = second_most_frequent_topology.is_some()
-        && second_most_frequent_topology.unwrap().nodes_count == most_frequent_topology.nodes_count;
+    let mut most_frequent_topology: Option<&TopologyView> = None;
+    let mut has_more_than_a_single_max = false;
+    let vec_iter = hash_view_map.iter().map(|(_, view)| view);
+    let mut new_slots = SlotMap::new();
+    // Find the most frequent topology view
+    for curr_view in vec_iter {
+        if most_frequent_topology.is_none() {
+            most_frequent_topology = Some(curr_view);
+            continue;
+        }
+        let max_view = match most_frequent_topology {
+            Some(view) => view,
+            None => {
+                most_frequent_topology = Some(curr_view);
+                continue;
+            }
+        };
+        if max_view.nodes_count < curr_view.nodes_count {
+            most_frequent_topology = Some(curr_view);
+            has_more_than_a_single_max = false;
+        } else if max_view.nodes_count == curr_view.nodes_count {
+            has_more_than_a_single_max = true;
+        }
+    }
+    let most_frequent_topology = match most_frequent_topology {
+        Some(view) => view,
+        None => unreachable!(),
+    };
     if has_more_than_a_single_max {
-        // More than a single most frequent view was found.
+        // More than a single most frequent view was found
         if (retries.is_some() && retries.unwrap().fetch_sub(1, atomic::Ordering::SeqCst) == 1)
             || num_of_nodes < 3
         {
             // If it's the last retry, or if we it's a 2-nodes cluster, we'll return all found topologies to be checked by the caller
-            let mut topology_vec = max_heap.into_vec();
-            topology_vec.push(most_frequent_topology);
-            return Ok(topology_vec);
+            for (idx, topology_view) in hash_view_map.iter() {
+                match parse_slots(&topology_view.topology_value, tls_mode)
+                    .and_then(|v| build_slot_map(&mut new_slots, v, read_from_replicas))
+                {
+                    Ok(_) => {
+                        return Ok(new_slots);
+                    }
+                    Err(e) => {
+                        // If it's the last view, raise the error
+                        if *idx as usize == hash_view_map.len() - 1 {
+                            return Err(e);
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            }
         }
-        let err = Err(RedisError::from((
+        return Err(RedisError::from((
             ErrorKind::ResponseError,
-            "Slot refresh error.",
-            "Couldn't get a majority in topology views".to_string(),
+            "Slot refresh error: Couldn't get a majority in topology views",
         )));
-        return err;
     }
     let accuracy_num = most_frequent_topology.nodes_count as f32 / num_of_nodes as f32;
     if accuracy_num >= MIN_ACCURACY_RATE {
-        Ok(vec![most_frequent_topology])
+        parse_slots(&most_frequent_topology.topology_value, tls_mode)
+            .and_then(|v| build_slot_map(&mut new_slots, v, read_from_replicas))?;
+        return Ok(new_slots);
     } else {
-        Err(RedisError::from((
+        return Err(RedisError::from((
             ErrorKind::ResponseError,
-            "Slot refresh error.",
-            "The accuracy of the topology view is too low".to_string(),
-        )))
+            "Slot refresh error: The accuracy of the topology view is too low",
+        )));
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::cluster_routing::SlotAddrs;
+
     use super::*;
 
     #[test]
@@ -988,46 +1029,106 @@ mod tests {
     #[test]
     fn test_topology_calculator() {
         let err = RedisError::from((ErrorKind::ResponseError, "parse error"));
+        let single_node_view = Value::Bulk(vec![Value::Bulk(vec![
+            Value::Int(0 as i64),
+            Value::Int(16383 as i64),
+            Value::Bulk(vec![
+                Value::Data("node1".as_bytes().to_vec()),
+                Value::Int(6379 as i64),
+            ]),
+        ])]);
+        let single_node_missing_slots_view = Value::Bulk(vec![Value::Bulk(vec![
+            Value::Int(0 as i64),
+            Value::Int(4000 as i64),
+            Value::Bulk(vec![
+                Value::Data("node1".as_bytes().to_vec()),
+                Value::Int(6379 as i64),
+            ]),
+        ])]);
+        let two_nodes_full_coverage_view = Value::Bulk(vec![
+            Value::Bulk(vec![
+                Value::Int(0 as i64),
+                Value::Int(4000 as i64),
+                Value::Bulk(vec![
+                    Value::Data("node1".as_bytes().to_vec()),
+                    Value::Int(6379 as i64),
+                ]),
+            ]),
+            Value::Bulk(vec![
+                Value::Int(4001 as i64),
+                Value::Int(16383 as i64),
+                Value::Bulk(vec![
+                    Value::Data("node2".as_bytes().to_vec()),
+                    Value::Int(6380 as i64),
+                ]),
+            ]),
+        ]);
+        let two_nodes_missing_slots_view = Value::Bulk(vec![
+            Value::Bulk(vec![
+                Value::Int(0 as i64),
+                Value::Int(3000 as i64),
+                Value::Bulk(vec![
+                    Value::Data("node3".as_bytes().to_vec()),
+                    Value::Int(6381 as i64),
+                ]),
+            ]),
+            Value::Bulk(vec![
+                Value::Int(4001 as i64),
+                Value::Int(16383 as i64),
+                Value::Bulk(vec![
+                    Value::Data("node4".as_bytes().to_vec()),
+                    Value::Int(6382 as i64),
+                ]),
+            ]),
+        ]);
 
-        // majority
+        // Has a majority, single_node_view should be chosen
         let topology_results = vec![
-            Ok(Value::Status("view1".to_string())),
-            Ok(Value::Status("view1".to_string())),
-            Ok(Value::Status("view2".to_string())),
+            Ok(single_node_view.clone()),
+            Ok(single_node_view.clone()),
+            Ok(two_nodes_full_coverage_view.clone()),
             Err(err),
         ];
-        let topology_view = calculate_topology(topology_results, None);
-        assert_eq!(
-            topology_view.unwrap()[0].topology_value,
-            Value::Status("view1".to_string())
-        );
+        let node1_addr = SlotAddrs::new("node1:6379".to_string(), None);
+        let node2_addr = SlotAddrs::new("node2:6380".to_string(), None);
+        let topology_view = calculate_topology(topology_results, None, None, false).unwrap();
+        let res: Vec<_> = topology_view.values().collect();
+        let excepted = vec![&node1_addr];
+        assert_eq!(res, excepted);
 
-        // no majority
+        // no majority, should return an error
         let topology_results = vec![
-            Ok(Value::Status("view1".to_string())),
-            Ok(Value::Status("view2".to_string())),
-            Ok(Value::Status("view3".to_string())),
+            Ok(single_node_view.clone()),
+            Ok(two_nodes_full_coverage_view.clone()),
+            Ok(two_nodes_missing_slots_view.clone()),
         ];
-        let topology_view = calculate_topology(topology_results, None);
+        let topology_view = calculate_topology(topology_results, None, None, false);
         assert!(topology_view.is_err());
 
-        // 2 nodes no majority
+        // no majority, last retry, should get the view that has a full slot coverage
         let topology_results = vec![
-            Ok(Value::Status("view1".to_string())),
-            Ok(Value::Status("view2".to_string())),
+            Ok(single_node_missing_slots_view.clone()),
+            Ok(two_nodes_full_coverage_view.clone()),
+            Ok(two_nodes_missing_slots_view.clone()),
         ];
-        let topology_view = calculate_topology(topology_results, None).unwrap();
-        let res: Vec<_> = topology_view.iter().map(|t| &t.topology_value).collect();
-        assert!(res.contains(&&Value::Status("view1".to_string())));
-        assert!(res.contains(&&Value::Status("view2".to_string())));
+        let topology_view = calculate_topology(
+            topology_results,
+            Some(Arc::new(AtomicUsize::new(1))),
+            None,
+            false,
+        )
+        .unwrap();
+        let res: Vec<_> = topology_view.values().collect();
+        let excepted: Vec<&SlotAddrs> = vec![&node1_addr, &node2_addr];
+        assert_eq!(res, excepted);
 
-        // 2 nodes 1 error
-        let err = RedisError::from((ErrorKind::ResponseError, "parse error"));
-        let topology_results = vec![Ok(Value::Status("view1".to_string())), Err(err)];
-        let topology_view = calculate_topology(topology_results, None);
-        assert_eq!(
-            topology_view.unwrap()[0].topology_value,
-            Value::Status("view1".to_string())
-        );
+        // 2 nodes no majority, should get the view that has a full slot coverage
+        let topology_results = vec![
+            Ok(two_nodes_full_coverage_view.clone()),
+            Ok(two_nodes_missing_slots_view.clone()),
+        ];
+        let topology_view = calculate_topology(topology_results, None, None, false).unwrap();
+        let res: Vec<_> = topology_view.values().collect();
+        assert_eq!(res, excepted);
     }
 }

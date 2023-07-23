@@ -34,7 +34,7 @@ use std::{
 
 use crate::{
     aio::{ConnectionLike, MultiplexedConnection},
-    cluster::{build_slot_map, calculate_topology, get_connection_info, parse_slots, slot_cmd},
+    cluster::{calculate_topology, get_connection_info, slot_cmd},
     cluster_client::{ClusterParams, RetryParams},
     cluster_routing::{
         MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, RoutingInfo,
@@ -545,7 +545,7 @@ where
         let inner = self.inner.clone();
 
         async move {
-            let read_guard = inner.conn_lock.write().await;
+            let read_guard = inner.conn_lock.read().await;
             let num_of_nodes = read_guard.0.len();
             let amount = std::cmp::min(num_of_nodes, MAX_REQUESTED_NODES);
             let mut requested_nodes = {
@@ -567,27 +567,15 @@ where
                 .filter_map(|r| r.ok())
                 .collect();
             topology_results.shuffle(&mut thread_rng());
-            let topology_vec = calculate_topology(topology_results, retries.clone())?;
-            let mut slots = SlotMap::new();
-            for (idx, topology_view) in topology_vec.iter().enumerate() {
-                match parse_slots(&topology_view.topology_value, inner.cluster_params.tls).and_then(
-                    |v| build_slot_map(&mut slots, v, inner.cluster_params.read_from_replicas),
-                ) {
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(e) => {
-                        // If it's the last view, raise the error.
-                        if idx == topology_vec.len() - 1 {
-                            return Err(e);
-                        } else {
-                            continue;
-                        }
-                    }
-                }
-            }
+            let new_slots = calculate_topology(
+                topology_results,
+                retries.clone(),
+                inner.cluster_params.tls,
+                inner.cluster_params.read_from_replicas,
+            )?;
+
             let connections: &ConnectionMap<C> = &read_guard.0;
-            let mut nodes = slots.values().flatten().collect::<Vec<_>>();
+            let mut nodes = new_slots.values().flatten().collect::<Vec<_>>();
             nodes.sort_unstable();
             nodes.dedup();
             let nodes_len = nodes.len();
@@ -613,7 +601,7 @@ where
 
             drop(read_guard);
             let mut write_guard = inner.conn_lock.write().await;
-            let _ = mem::replace(&mut write_guard.1, slots);
+            let _ = mem::replace(&mut write_guard.1, new_slots);
             let _ = mem::replace(&mut write_guard.0, new_connections);
             Ok(())
         }

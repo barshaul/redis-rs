@@ -481,7 +481,7 @@ pub enum SlotAddr {
 /// which stores only the master and [optional] replica
 /// to avoid the need to choose a replica each time
 /// a command is executed
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct SlotAddrs([String; 2]);
 
 impl SlotAddrs {
