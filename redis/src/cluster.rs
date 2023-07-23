@@ -302,7 +302,7 @@ where
         )));
         for conn in samples.iter_mut() {
             let value = conn.req_command(&slot_cmd())?;
-            match parse_slots(value, self.cluster_params.tls).and_then(|v| {
+            match parse_slots(&value, self.cluster_params.tls).and_then(|v| {
                 build_slot_map(&mut new_slots, v, self.cluster_params.read_from_replicas)
             }) {
                 Ok(_) => {

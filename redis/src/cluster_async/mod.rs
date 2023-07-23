@@ -34,7 +34,7 @@ use std::{
 
 use crate::{
     aio::{ConnectionLike, MultiplexedConnection},
-    cluster::{build_slot_map, get_connection_info, parse_slots, slot_cmd},
+    cluster::{build_slot_map, calculate_topology, get_connection_info, parse_slots, slot_cmd},
     cluster_client::{ClusterParams, RetryParams},
     cluster_routing::{
         MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, RoutingInfo,
@@ -571,9 +571,7 @@ where
             let mut slots = SlotMap::new();
             for (idx, topology_view) in topology_vec.iter().enumerate() {
                 match parse_slots(&topology_view.topology_value, inner.cluster_params.tls).and_then(
-                    |v| {
-                        Self::build_slot_map(&mut slots, v, inner.cluster_params.read_from_replicas)
-                    },
+                    |v| build_slot_map(&mut slots, v, inner.cluster_params.read_from_replicas),
                 ) {
                     Ok(_) => {
                         break;
