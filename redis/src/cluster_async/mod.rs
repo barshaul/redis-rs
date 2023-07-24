@@ -34,12 +34,13 @@ use std::{
 
 use crate::{
     aio::{ConnectionLike, MultiplexedConnection},
-    cluster::{calculate_topology, get_connection_info, slot_cmd},
+    cluster::{get_connection_info, slot_cmd},
     cluster_client::{ClusterParams, RetryParams},
     cluster_routing::{
         MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, RoutingInfo,
         SingleNodeRoutingInfo, SlotMap,
     },
+    cluster_topology::calculate_topology,
     Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisFuture, RedisResult,
     Value,
 };
