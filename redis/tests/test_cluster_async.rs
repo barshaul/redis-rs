@@ -394,6 +394,27 @@ fn test_async_cluster_tryagain_exhaust_retries() {
     assert_eq!(requests.load(atomic::Ordering::SeqCst), 3);
 }
 
+fn get_node_view_and_port_index(
+    num_of_view: usize,
+    ports: &Vec<u16>,
+    called_port: u16,
+) -> (usize, usize) {
+    let port_index = ports
+        .iter()
+        .position(|&p| p == called_port)
+        .unwrap_or_else(|| {
+            panic!(
+                "CLUSTER SLOTS was called with unknown port: {called_port}; Known ports: {:?}",
+                ports
+            )
+        });
+    // If we have less views than nodes, use the last view
+    if port_index < num_of_view {
+        (port_index, port_index)
+    } else {
+        (num_of_view - 1, port_index)
+    }
+}
 #[test]
 fn test_async_cluster_move_error_when_new_node_is_added() {
     let name = "rebuild_with_extra_nodes";
@@ -466,7 +487,7 @@ fn test_async_cluster_move_error_when_new_node_is_added() {
     assert_eq!(value, Ok(Some(123)));
 }
 
-fn test_async_cluster_move_error_refresh_topology(
+fn test_cluster_refresh_topology_after_moved_error_get_succeed(
     slots_config_vec: Vec<Vec<MockSlotRange>>,
     ports: Vec<u16>,
     has_a_majority: bool,
@@ -509,19 +530,8 @@ fn test_async_cluster_move_error_refresh_topology(
             )),
             _ => {
                 if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
-                    let num_of_view = slots_config_vec.len();
-                    let port_index = ports.iter().position(|&p| p == port).unwrap_or_else(|| {
-                        panic!(
-                            "CLUSTER SLOTS was called with unknown port: {port}; Known ports: {:?}",
-                            ports
-                        )
-                    });
-                    // If we have less views than nodes, use the last view
-                    let view_index = if port_index < num_of_view {
-                        port_index
-                    } else {
-                        num_of_view - 1
-                    };
+                    let (view_index, port_index) =
+                        get_node_view_and_port_index(slots_config_vec.len(), &ports, port);
                     if has_a_majority {
                         // We should be able to refresh the topology in the first try if we have a majority in
                         // the topology views, so CLUSTER SLOTS should be called only once for each node
@@ -552,7 +562,7 @@ fn test_async_cluster_move_error_refresh_topology(
     assert_eq!(value, Ok(Some(123)));
 }
 
-fn test_async_cluster_client_initialization_refresh_topology(
+fn test_cluster_refresh_topology_in_client_init_get_succeed(
     slots_config_vec: Vec<Vec<MockSlotRange>>,
     ports: Vec<u16>,
 ) {
@@ -578,19 +588,8 @@ fn test_async_cluster_client_initialization_refresh_topology(
                 if contains_slice(cmd, b"PING") {
                     return Err(Ok(Value::Status("OK".into())));
                 } else if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
-                    let num_of_view = slots_config_vec.len();
-                    let port_index = ports.iter().position(|&p| p == port).unwrap_or_else(|| {
-                        panic!(
-                            "CLUSTER SLOTS was called with unknown port: {port}; Known ports: {:?}",
-                            ports
-                        )
-                    });
-                    // If we have less views than nodes, use the last view
-                    let view_index = if port_index < num_of_view {
-                        port_index
-                    } else {
-                        num_of_view - 1
-                    };
+                    let (view_index, _) =
+                        get_node_view_and_port_index(slots_config_vec.len(), &ports, port);
                     return Err(Ok(create_topology_from_config(
                         name,
                         slots_config_vec[view_index].clone(),
@@ -669,13 +668,17 @@ fn get_topology_with_majority(ports: &Vec<u16>) -> Vec<Vec<MockSlotRange>> {
 #[test]
 fn test_async_cluster_move_error_refresh_topology_all_nodes_agree() {
     let ports = get_ports(3);
-    test_async_cluster_move_error_refresh_topology(get_topology_with_majority(&ports), ports, true);
+    test_cluster_refresh_topology_after_moved_error_get_succeed(
+        get_topology_with_majority(&ports),
+        ports,
+        true,
+    );
 }
 
 #[test]
 fn test_async_cluster_client_initilization_refresh_topology_all_nodes_agree() {
     let ports = get_ports(3);
-    test_async_cluster_client_initialization_refresh_topology(
+    test_cluster_refresh_topology_in_client_init_get_succeed(
         get_topology_with_majority(&ports),
         ports,
     );
@@ -685,7 +688,7 @@ fn test_async_cluster_client_initilization_refresh_topology_all_nodes_agree() {
 fn test_async_cluster_move_error_refresh_topology_no_majority() {
     for num_of_nodes in 2..4 {
         let ports = get_ports(num_of_nodes);
-        test_async_cluster_move_error_refresh_topology(
+        test_cluster_refresh_topology_after_moved_error_get_succeed(
             get_no_majority_topology_view(&ports),
             ports,
             false,
