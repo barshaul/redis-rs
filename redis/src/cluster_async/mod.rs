@@ -547,10 +547,13 @@ where
         async move {
             let read_guard = inner.conn_lock.read().await;
             let num_of_nodes = read_guard.0.len();
-            let amount = std::cmp::min(num_of_nodes, MAX_REQUESTED_NODES);
+            let num_of_nodes_to_query = std::cmp::min(num_of_nodes, MAX_REQUESTED_NODES);
             let mut requested_nodes = {
                 let mut rng = thread_rng();
-                read_guard.0.values().choose_multiple(&mut rng, amount)
+                read_guard
+                    .0
+                    .values()
+                    .choose_multiple(&mut rng, num_of_nodes_to_query)
             };
             let mut topology_join_results =
                 futures::future::join_all(requested_nodes.iter_mut().map(|conn| async move {
@@ -568,7 +571,7 @@ where
                 retries.clone(),
                 inner.cluster_params.tls,
                 inner.cluster_params.read_from_replicas,
-                num_of_nodes,
+                num_of_nodes_to_query,
             )?;
 
             let connections: &ConnectionMap<C> = &read_guard.0;
