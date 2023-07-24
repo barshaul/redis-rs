@@ -552,26 +552,23 @@ where
                 let mut rng = thread_rng();
                 read_guard.0.values().choose_multiple(&mut rng, amount)
             };
-            let mut cluster_slot_futures = Vec::new();
-            for conn in requested_nodes.iter_mut() {
-                let mut conn: C = conn.clone().await;
-                let slots_future = async move { conn.req_packed_command(&slot_cmd()).await };
-                #[cfg(feature = "tokio-comp")]
-                cluster_slot_futures.push(tokio::spawn(slots_future));
-                #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
-                cluster_slot_futures.push(AsyncStd::spawn(slots_future));
-            }
-            let mut topology_join_results = futures::future::join_all(cluster_slot_futures).await;
-            let mut topology_results: Vec<_> = topology_join_results
+            let mut topology_join_results =
+                futures::future::join_all(requested_nodes.iter_mut().map(|conn| async move {
+                    let mut conn: C = conn.clone().await;
+                    conn.req_packed_command(&slot_cmd()).await
+                }))
+                .await;
+            let mut topology_values: Vec<_> = topology_join_results
                 .drain(..)
                 .filter_map(|r| r.ok())
                 .collect();
-            topology_results.shuffle(&mut thread_rng());
+            topology_values.shuffle(&mut thread_rng());
             let new_slots = calculate_topology(
-                topology_results,
+                topology_values,
                 retries.clone(),
                 inner.cluster_params.tls,
                 inner.cluster_params.read_from_replicas,
+                num_of_nodes,
             )?;
 
             let connections: &ConnectionMap<C> = &read_guard.0;
@@ -601,8 +598,8 @@ where
 
             drop(read_guard);
             let mut write_guard = inner.conn_lock.write().await;
-            let _ = mem::replace(&mut write_guard.1, new_slots);
-            let _ = mem::replace(&mut write_guard.0, new_connections);
+            write_guard.1 = new_slots;
+            write_guard.0 = new_connections;
             Ok(())
         }
     }
