@@ -1,3 +1,5 @@
+//! This module provides the functionality to refresh and calculate the cluster topology for Redis Cluster.
+
 use crate::cluster::get_connection_addr;
 use crate::cluster_routing::SlotMap;
 use crate::cluster_routing::SLOT_SIZE;
@@ -5,9 +7,16 @@ use crate::{cluster::TlsMode, cluster_routing::Slot, ErrorKind, RedisError, Redi
 use derivative::Derivative;
 use log::trace;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
-use std::{collections::HashMap, sync::atomic};
+use std::time::Duration;
+
+/// The default number of refersh topology retries
+pub const DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES: usize = 3;
+/// The default timeout for retrying topology refresh
+pub const DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
+/// The default initial interval for retrying topology refresh
+pub const DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Derivative)]
 #[derivative(PartialEq, PartialOrd, Ord)]
@@ -130,7 +139,7 @@ fn calculate_hash<T: Hash>(t: &T) -> u64 {
 
 pub(crate) fn calculate_topology(
     topology_views: Vec<Value>,
-    retries: Option<Arc<atomic::AtomicUsize>>, // TODO: change to usize
+    curr_retry: usize,
     tls_mode: Option<TlsMode>,
     read_from_replicas: bool,
     num_of_queried_nodes: usize,
@@ -180,10 +189,8 @@ pub(crate) fn calculate_topology(
     };
     if has_more_than_a_single_max {
         // More than a single most frequent view was found
-        if (retries.is_some() && retries.unwrap().fetch_sub(1, atomic::Ordering::SeqCst) == 1)
-            || num_of_queried_nodes < 3
-        {
-            // If it's the last retry, or if we it's a 2-nodes cluster, we'll return all found topologies to be checked by the caller
+        if curr_retry >= DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES || num_of_queried_nodes < 3 {
+            // If we overreached the last retry, or if we it's a 2-nodes cluster, we'll return all found topologies to be checked by the caller
             for (idx, topology_view) in hash_view_map.iter() {
                 match parse_slots(&topology_view.topology_value, tls_mode)
                     .and_then(|v| build_slot_map(&mut new_slots, v, read_from_replicas))
@@ -225,7 +232,6 @@ pub(crate) fn calculate_topology(
 mod tests {
     use super::*;
     use crate::cluster_routing::SlotAddrs;
-    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_topology_calculator() {
@@ -292,19 +298,19 @@ mod tests {
         let node1_addr = SlotAddrs::new("node1:6379".to_string(), None);
         let node2_addr = SlotAddrs::new("node2:6380".to_string(), None);
         let topology_view =
-            calculate_topology(topology_results, None, None, false, queried_nodes).unwrap();
+            calculate_topology(topology_results, 1, None, false, queried_nodes).unwrap();
         let res: Vec<_> = topology_view.values().collect();
         let excepted = vec![&node1_addr];
         assert_eq!(res, excepted);
 
-        // 3 nodes queried: No majority, should return an error
+        // 3 nodes queried: No majority, not in the last retry, should return an error
         queried_nodes = 3;
         let topology_results = vec![
             single_node_view,
             two_nodes_full_coverage_view.clone(),
             two_nodes_missing_slots_view.clone(),
         ];
-        let topology_view = calculate_topology(topology_results, None, None, false, queried_nodes);
+        let topology_view = calculate_topology(topology_results, 1, None, false, queried_nodes);
         assert!(topology_view.is_err());
 
         // 3 nodes queried:: No majority, last retry, should get the view that has a full slot coverage
@@ -313,14 +319,8 @@ mod tests {
             two_nodes_full_coverage_view.clone(),
             two_nodes_missing_slots_view.clone(),
         ];
-        let topology_view = calculate_topology(
-            topology_results,
-            Some(Arc::new(AtomicUsize::new(1))),
-            None,
-            false,
-            queried_nodes,
-        )
-        .unwrap();
+        let topology_view =
+            calculate_topology(topology_results, 3, None, false, queried_nodes).unwrap();
         let res: Vec<_> = topology_view.values().collect();
         let excepted: Vec<&SlotAddrs> = vec![&node1_addr, &node2_addr];
         assert_eq!(res, excepted);
@@ -329,7 +329,7 @@ mod tests {
         queried_nodes = 2;
         let topology_results = vec![two_nodes_full_coverage_view, two_nodes_missing_slots_view];
         let topology_view =
-            calculate_topology(topology_results, None, None, false, queried_nodes).unwrap();
+            calculate_topology(topology_results, 2, None, false, queried_nodes).unwrap();
         let res: Vec<_> = topology_view.values().collect();
         assert_eq!(res, excepted);
     }

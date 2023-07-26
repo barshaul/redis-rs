@@ -28,7 +28,10 @@ use std::{
     marker::Unpin,
     mem,
     pin::Pin,
-    sync::{atomic, Arc},
+    sync::{
+        atomic::{self, AtomicUsize},
+        Arc,
+    },
     task::{self, Poll},
 };
 
@@ -40,13 +43,26 @@ use crate::{
         MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, RoutingInfo,
         SingleNodeRoutingInfo, SlotMap,
     },
-    cluster_topology::calculate_topology,
+    cluster_topology::{
+        calculate_topology, DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL,
+        DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT,
+    },
     Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisFuture, RedisResult,
     Value,
 };
 
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use crate::aio::{async_std::AsyncStd, RedisRuntime};
+#[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
+use backoff_async::future::retry;
+#[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
+use backoff_async::{Error, ExponentialBackoff};
+
+#[cfg(feature = "tokio-comp")]
+use backoff_tokio::future::retry;
+#[cfg(feature = "tokio-comp")]
+use backoff_tokio::{Error, ExponentialBackoff};
+
 use futures::{
     future::{self, BoxFuture},
     prelude::*,
@@ -466,8 +482,7 @@ where
             pending_requests: Vec::new(),
             state: ConnectionState::PollComplete,
         };
-        // TODO: add retries
-        connection.refresh_slots().await?;
+        connection.refresh_slots_with_retries().await?;
         Ok(connection)
     }
 
@@ -533,17 +548,37 @@ where
         }
     }
 
-    // Query a node to discover slot-> master mappings.
-    fn refresh_slots(&mut self) -> impl Future<Output = RedisResult<()>> {
-        self.refresh_slots_with_retries(None)
-    }
     // Query a node to discover slot-> master mappings with retries
-    fn refresh_slots_with_retries(
-        &mut self,
-        retries: Option<Arc<atomic::AtomicUsize>>,
+    fn refresh_slots_with_retries(&mut self) -> impl Future<Output = RedisResult<()>> {
+        let inner = self.inner.clone();
+        async move {
+            let retry_strategy = ExponentialBackoff {
+                initial_interval: DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL,
+                max_interval: DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT,
+                ..Default::default()
+            };
+            let retries_counter = Arc::new(AtomicUsize::new(0));
+            retry(retry_strategy, || {
+                retries_counter
+                    .clone()
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+                Self::refresh_slots(
+                    inner.clone(),
+                    retries_counter.load(atomic::Ordering::Relaxed),
+                )
+                .map_err(Error::from)
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    // Query a node to discover slot-> master mappings
+    fn refresh_slots(
+        inner: Arc<InnerCore<C>>,
+        curr_retry: usize,
     ) -> impl Future<Output = RedisResult<()>> {
         const MAX_REQUESTED_NODES: usize = 50;
-        let inner = self.inner.clone();
 
         async move {
             let read_guard = inner.conn_lock.read().await;
@@ -569,7 +604,7 @@ where
             topology_values.shuffle(&mut thread_rng());
             let new_slots = calculate_topology(
                 topology_values,
-                retries.clone(),
+                curr_retry,
                 inner.cluster_params.tls,
                 inner.cluster_params.read_from_replicas,
                 num_of_nodes_to_query,
@@ -873,7 +908,7 @@ where
                 }
                 Poll::Ready(Err(err)) => {
                     self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
-                        self.refresh_slots(),
+                        self.refresh_slots_with_retries(),
                     )));
                     Poll::Ready(Err(err))
                 }
@@ -1107,7 +1142,7 @@ where
                     PollFlushAction::None => return Poll::Ready(Ok(())),
                     PollFlushAction::RebuildSlots => {
                         self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(
-                            Box::pin(self.refresh_slots()),
+                            Box::pin(self.refresh_slots_with_retries()),
                         ));
                     }
                     PollFlushAction::Reconnect(addrs) => {
