@@ -147,6 +147,7 @@ impl ClusterClientBuilder {
                     host: _,
                     port: _,
                     insecure,
+                    socket_addr: _,
                 } => Some(match insecure {
                     false => TlsMode::Secure,
                     true => TlsMode::Insecure,

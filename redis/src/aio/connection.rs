@@ -395,7 +395,11 @@ pub(crate) async fn connect_simple<T: RedisRuntime>(
             ref host,
             port,
             insecure,
+            socket_addr,
         } => {
+            if let Some(socket_addr) = socket_addr {
+                return <T>::connect_tcp_tls(host, socket_addr, insecure).await;
+            }
             let socket_addrs = get_socket_addrs(host, port).await?;
             select_ok(
                 socket_addrs.map(|socket_addr| <T>::connect_tcp_tls(host, socket_addr, insecure)),

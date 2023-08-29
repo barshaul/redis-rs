@@ -37,6 +37,7 @@
 //! ```
 use std::cell::RefCell;
 use std::iter::Iterator;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
@@ -309,7 +310,7 @@ where
     }
 
     fn connect(&self, node: &str) -> RedisResult<C> {
-        let info = get_connection_info(node, self.cluster_params.clone())?;
+        let info = get_connection_info(node, self.cluster_params.clone(), None)?;
 
         let mut conn = C::connect(info, Some(self.cluster_params.connection_timeout))?;
         if self.read_from_replicas {
@@ -708,6 +709,7 @@ fn get_random_connection<C: ConnectionLike + Connect + Sized>(
 pub(crate) fn get_connection_info(
     node: &str,
     cluster_params: ClusterParams,
+    socket_addr: Option<SocketAddr>,
 ) -> RedisResult<ConnectionInfo> {
     let invalid_error = || (ErrorKind::InvalidClientConfig, "Invalid node string");
 
@@ -721,7 +723,7 @@ pub(crate) fn get_connection_info(
         .ok_or_else(invalid_error)?;
 
     Ok(ConnectionInfo {
-        addr: get_connection_addr(host.to_string(), port, cluster_params.tls),
+        addr: get_connection_addr(host.to_string(), port, cluster_params.tls, socket_addr),
         redis: RedisConnectionInfo {
             password: cluster_params.password,
             username: cluster_params.username,
@@ -730,17 +732,24 @@ pub(crate) fn get_connection_info(
     })
 }
 
-pub(crate) fn get_connection_addr(host: String, port: u16, tls: Option<TlsMode>) -> ConnectionAddr {
+pub(crate) fn get_connection_addr(
+    host: String,
+    port: u16,
+    tls: Option<TlsMode>,
+    socket_addr: Option<SocketAddr>,
+) -> ConnectionAddr {
     match tls {
         Some(TlsMode::Secure) => ConnectionAddr::TcpTls {
             host,
             port,
             insecure: false,
+            socket_addr,
         },
         Some(TlsMode::Insecure) => ConnectionAddr::TcpTls {
             host,
             port,
             insecure: true,
+            socket_addr,
         },
         _ => ConnectionAddr::Tcp(host, port),
     }
@@ -778,13 +787,13 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            let res = get_connection_info(input, ClusterParams::default());
+            let res = get_connection_info(input, ClusterParams::default(), None);
             assert_eq!(res.unwrap().addr, expected);
         }
 
         let cases = vec![":0", "[]:6379"];
         for input in cases {
-            let res = get_connection_info(input, ClusterParams::default());
+            let res = get_connection_info(input, ClusterParams::default(), None);
             assert_eq!(
                 res.err(),
                 Some(RedisError::from((

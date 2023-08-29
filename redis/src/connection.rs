@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io::{self, Write};
-use std::net::{self, TcpStream, ToSocketAddrs};
+use std::net::{self, SocketAddr, TcpStream, ToSocketAddrs};
 use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::str::{from_utf8, FromStr};
@@ -64,6 +64,10 @@ pub enum ConnectionAddr {
         host: String,
         /// Port
         port: u16,
+        /// Optional - An internet socket address for this node.
+        /// If the hostname is a DNS endpoint, the socket address will encompass the actual IP.
+        /// The hostname should be preserved in the connection information as a DNS name for the purpose of TLS hostname verification.
+        socket_addr: Option<SocketAddr>,
         /// Disable hostname verification when connecting.
         ///
         /// # Warning
@@ -212,6 +216,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
                     host,
                     port,
                     insecure: true,
+                    socket_addr: None,
                 },
                 Some(_) => fail!((
                     ErrorKind::InvalidClientConfig,
@@ -221,6 +226,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
                     host,
                     port,
                     insecure: false,
+                    socket_addr: None,
                 },
             }
         }
@@ -433,6 +439,7 @@ impl ActualConnection {
                 ref host,
                 port,
                 insecure,
+                ..
             } => {
                 let tls_connector = if insecure {
                     TlsConnector::builder()
@@ -492,6 +499,7 @@ impl ActualConnection {
                 ref host,
                 port,
                 insecure,
+                socket_addr: _,
             } => {
                 let host: &str = host;
                 let config = create_rustls_config(insecure)?;
