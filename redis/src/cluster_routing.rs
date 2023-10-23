@@ -540,7 +540,7 @@ impl Routable for Value {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Slot {
     start: u16,
     end: u16,

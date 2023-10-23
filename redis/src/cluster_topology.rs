@@ -51,6 +51,26 @@ impl TopologyView {
                     (slot_count, parsed_slots)
                 })
     }
+
+    fn eq_topology(&self, other: &Self) -> bool {
+        if other.slots_and_count.is_none() && self.slots_and_count.is_none() {
+            return true;
+        } else if self.slots_and_count.is_none() || other.slots_and_count.is_none() {
+            return false;
+        }
+        let self_iter = self.slots_and_count.as_ref().unwrap().1.iter();
+        let other_iter = other.slots_and_count.as_ref().unwrap().1.iter();
+        if self_iter.len() != other_iter.len() {
+            return false;
+        }
+        for it in self_iter.zip(other_iter) {
+            let (self_slot, other_slot) = it;
+            if self_slot != other_slot {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -279,7 +299,8 @@ pub(crate) fn parse_slots(raw_slot_resp: &Value, tls: Option<TlsMode>) -> RedisR
                 continue;
             }
 
-            let replicas = nodes.split_off(1);
+            let mut replicas = nodes.split_off(1);
+            replicas.sort();
             result.push(Slot::new(start, end, nodes.pop().unwrap(), replicas));
         }
     }
@@ -351,8 +372,12 @@ pub(crate) fn calculate_topology(
                         .as_ref()
                         .map(|(slot_count, _)| *slot_count)
                         .unwrap_or(0);
-
-                    if let std::cmp::Ordering::Less = slot_count.cmp(&curr_slot_count) {
+                    if std::cmp::Ordering::Equal == slot_count.cmp(&curr_slot_count)
+                        && most_frequent_topology.eq_topology(&curr_view)
+                    {
+                        // Deeper check revealed that both views holds the same view
+                        non_unique_max_node_count = false;
+                    } else if let std::cmp::Ordering::Less = slot_count.cmp(&curr_slot_count) {
                         most_frequent_topology = curr_view;
                     }
                 } else {
