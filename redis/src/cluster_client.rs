@@ -76,6 +76,12 @@ pub(crate) struct ClusterParams {
     pub(crate) topology_checks_interval: Option<Duration>,
 }
 
+impl ClusterParams {
+    pub(crate) fn management_connections_enabled(&self) -> bool {
+        self.topology_checks_interval.is_some()
+    }
+}
+
 impl From<BuilderParams> for ClusterParams {
     fn from(value: BuilderParams) -> Self {
         Self {

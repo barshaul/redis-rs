@@ -16,6 +16,8 @@ pub const DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES: usize = 3;
 pub const DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT: Duration = Duration::from_secs(1);
 /// The default initial interval for retrying topology refresh
 pub const DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL: Duration = Duration::from_millis(100);
+/// The client's management connections name
+pub const MANAGEMENT_CONN_NAME: &str = "babushka_management_connection";
 
 pub(crate) const SLOT_SIZE: u16 = 16384;
 pub(crate) type TopologyHash = u64;
