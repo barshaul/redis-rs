@@ -117,6 +117,10 @@ impl ClusterParams {
             protocol: value.protocol,
         })
     }
+
+    pub(crate) fn management_connections_enabled(&self) -> bool {
+        self.topology_checks_interval.is_some()
+    }
 }
 
 /// Used to configure and build a [`ClusterClient`].

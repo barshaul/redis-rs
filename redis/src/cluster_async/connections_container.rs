@@ -35,7 +35,7 @@ where
     pub(crate) fn get_connection(&self, conn_type: &ConnectionType) -> Connection {
         match conn_type {
             ConnectionType::User => self.user_connection.clone(),
-            ConnectionType::_Management => self
+            ConnectionType::Management => self
                 .management_connection
                 .clone()
                 .unwrap_or_else(|| self.user_connection.clone()),
@@ -47,7 +47,7 @@ where
 
 pub(crate) enum ConnectionType {
     User,
-    _Management,
+    Management,
 }
 
 /// This opaque type allows us to change the way that the connections are organized
@@ -678,7 +678,7 @@ mod tests {
     fn get_random_management_connections() {
         let container = create_container_with_strategy(ReadFromReplicaStrategy::RoundRobin, true);
         let mut random_connections: Vec<_> = container
-            .random_connections(1000, ConnectionType::_Management)
+            .random_connections(1000, ConnectionType::Management)
             .map(|pair| pair.1)
             .collect();
         random_connections.sort();

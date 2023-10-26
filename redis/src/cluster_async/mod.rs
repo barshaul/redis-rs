@@ -41,7 +41,6 @@ use std::{
 use crate::{
     aio::{get_socket_addrs, ConnectionLike, MultiplexedConnection},
     cluster::{get_connection_info, slot_cmd},
-    cluster_async::connections_container::ClusterNode,
     cluster_client::{ClusterParams, RetryParams},
     cluster_routing::{
         MultipleNodeRoutingInfo, Redirect, ResponsePolicy, Route, RoutingInfo,
@@ -50,6 +49,7 @@ use crate::{
     cluster_topology::{
         calculate_topology, DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES,
         DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL, DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT,
+        MANAGEMENT_CONN_NAME,
     },
     Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisFuture, RedisResult,
     Value,
@@ -89,7 +89,8 @@ use tokio::sync::{
 use tracing::{info, trace, warn};
 
 use self::connections_container::{
-    ConnectionAndIdentifier, ConnectionType, ConnectionsMap, Identifier as ConnectionIdentifier,
+    ClusterNode, ConnectionAndIdentifier, ConnectionType, ConnectionsMap,
+    Identifier as ConnectionIdentifier,
 };
 
 /// This represents an async Redis Cluster connection. It stores the
@@ -323,6 +324,11 @@ impl fmt::Debug for ConnectionState {
     }
 }
 
+enum TopologyRefresh {
+    Required,
+    Unrequired,
+}
+
 #[derive(Clone)]
 struct RequestInfo<C> {
     cmd: CmdArg<C>,
@@ -495,6 +501,17 @@ enum ConnectionCheck<C> {
     Nothing,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum RefreshConnectionType {
+    // Refresh only user connections
+    OnlyUserConnection,
+    // Refresh only management connections
+    OnlyManagementConnection,
+    // Refresh all configured connections: user connections for client with disabled management connections or
+    // both management and user connections when enabled.
+    AllConfiguredConnections,
+}
+
 impl<C> ClusterConnInner<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
@@ -526,15 +543,15 @@ where
         };
         Self::refresh_slots_with_retries(connection.inner.clone()).await?;
         if let Some(duration) = topology_checks_interval {
-            let periodic_task = ClusterConnInner::periodic_topology_check(
+            let periodic_checks_task = ClusterConnInner::periodic_topology_check(
                 connection.inner.clone(),
                 duration,
                 shutdown_flag,
             );
             #[cfg(feature = "tokio-comp")]
-            tokio::spawn(periodic_task);
+            tokio::spawn(periodic_checks_task);
             #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
-            AsyncStd::spawn(periodic_task);
+            AsyncStd::spawn(periodic_checks_task);
         }
 
         Ok(Disposable::new(connection))
@@ -591,18 +608,20 @@ where
             .map(|(node_addr, socket_addr)| {
                 let params: ClusterParams = params.clone();
                 async move {
-                    let result = connect_and_check(&node_addr, params, socket_addr).await;
+                    let result = connect_and_check(
+                        &node_addr,
+                        params,
+                        socket_addr,
+                        RefreshConnectionType::AllConfiguredConnections,
+                        None,
+                    )
+                    .await;
                     let node_identifier = if let Some(socket_addr) = socket_addr {
                         socket_addr.to_string()
                     } else {
                         node_addr
                     };
-                    result.map(|(conn, ip)| {
-                        (
-                            node_identifier,
-                            ClusterNode::new(async { conn }.boxed().shared(), None, ip),
-                        )
-                    })
+                    result.map(|node| (node_identifier, node))
                 }
             })
             .buffer_unordered(initial_nodes.len())
@@ -633,37 +652,32 @@ where
         Ok(connections.0)
     }
 
-    fn refresh_connections(
-        &mut self,
+    async fn refresh_connections(
+        inner: Arc<InnerCore<C>>,
         identifiers: Vec<ConnectionIdentifier>,
-    ) -> impl Future<Output = ()> {
+        conn_type: RefreshConnectionType,
+    ) {
         info!("Started refreshing connections to {:?}", identifiers);
-        let inner = self.inner.clone();
-        async move {
-            let mut connections_container = inner.conn_lock.write().await;
-            let cluster_params = &inner.cluster_params;
-            stream::iter(identifiers.into_iter())
-                .fold(
-                    &mut *connections_container,
-                    |connections_container, identifier| async move {
-                        let addr_option = connections_container.address_for_identifier(&identifier);
-                        let node_option = connections_container.remove_node(&identifier);
-                        if let Some(addr) = addr_option {
-                            let conn =
-                                Self::get_or_create_conn(&addr, node_option, cluster_params).await;
-                            if let Ok((conn, ip)) = conn {
-                                connections_container.replace_or_add_connection_for_address(
-                                    addr,
-                                    ClusterNode::new(async { conn }.boxed().shared(), None, ip),
-                                );
-                            }
+        let mut connections_container = inner.conn_lock.write().await;
+        let cluster_params = &inner.cluster_params;
+        stream::iter(identifiers.into_iter())
+            .fold(
+                &mut *connections_container,
+                |connections_container, identifier| async move {
+                    let addr_option = connections_container.address_for_identifier(&identifier);
+                    let node_option = connections_container.remove_node(&identifier);
+                    if let Some(addr) = addr_option {
+                        let conn =
+                            Self::get_or_create_conn(&addr, cluster_params, conn_type, node_option)
+                                .await;
+                        if let Ok(node) = conn {
+                            connections_container.replace_or_add_connection_for_address(addr, node);
                         }
-                        connections_container
-                    },
-                )
-                .await;
-            info!("refresh connections completed");
-        }
+                    }
+                    connections_container
+                },
+            )
+            .await;
     }
 
     async fn aggregate_results(
@@ -794,34 +808,80 @@ where
                 Self::check_for_topology_diff(inner.clone()).map_err(Error::from)
             })
             .await;
-            if let Ok(true) = topology_check_res {
-                let _ = Self::refresh_slots_with_retries(inner.clone()).await;
-            };
+            if let Ok((refresh_state, failed_connections)) = topology_check_res {
+                match refresh_state {
+                    TopologyRefresh::Required => {
+                        info!("Topology change found, starting to refresh slots");
+                        let _ = Self::refresh_slots_with_retries(inner.clone()).await;
+                    }
+                    TopologyRefresh::Unrequired => {
+                        if !failed_connections.is_empty() {
+                            let _res = Self::refresh_connections(
+                                inner.clone(),
+                                failed_connections,
+                                RefreshConnectionType::OnlyManagementConnection,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Queries `num_of_nodes` random nodes for their topology views.
+    /// Returns a tuple consisting of:
+    /// 1. A vector containing the successful topology results
+    /// 2. A vector that contains identifiers of nodes that experienced connection failures during the query
+    async fn get_topology_values_and_failed_conn(
+        conn_container_guard: &tokio::sync::RwLockReadGuard<'_, ConnectionsContainer<C>>,
+        num_of_nodes: usize,
+        conn_type: ConnectionType,
+    ) -> (Vec<Value>, Vec<ConnectionIdentifier>) {
+        let requested_nodes = conn_container_guard.random_connections(num_of_nodes, conn_type);
+        let topology_join_results =
+            futures::future::join_all(requested_nodes.map(|node| async move {
+                let mut conn: C = node.1.await;
+                (node.0, conn.req_packed_command(&slot_cmd()).await)
+            }))
+            .await;
+        let mut topology_values: Vec<_> = vec![];
+        let mut failed_connections: Vec<_> = vec![];
+        for (identifier, result) in topology_join_results.into_iter() {
+            match result {
+                Ok(res) => topology_values.push(res),
+                Err(err) => {
+                    if err.is_connection_dropped() {
+                        failed_connections.push(identifier);
+                    }
+                }
+            }
+        }
+        (topology_values, failed_connections)
     }
 
     /// Queries log2n nodes (where n represents the number of cluster nodes) to determine whether their
     /// topology view differs from the one currently stored in the connection manager.
-    /// Returns true if change was detected, otherwise false.
-    async fn check_for_topology_diff(inner: Arc<InnerCore<C>>) -> RedisResult<bool> {
+    /// returns a tuple containing two elements: a boolean indicating whether a change was detected, and a vector containing identifiers of failed connections.
+    async fn check_for_topology_diff(
+        inner: Arc<InnerCore<C>>,
+    ) -> RedisResult<(TopologyRefresh, Vec<ConnectionIdentifier>)> {
         let read_guard = inner.conn_lock.read().await;
-        let num_of_nodes: usize = read_guard.len();
         // TODO: Starting from Rust V1.67, integers has logarithms support.
         // When we no longer need to support Rust versions < 1.67, remove fast_math and transition to the ilog2 function.
         let num_of_nodes_to_query =
-            std::cmp::max(fast_math::log2_raw(num_of_nodes as f32) as usize, 1);
-        let requested_nodes =
-            read_guard.random_connections(num_of_nodes_to_query, ConnectionType::User);
-        let topology_join_results =
-            futures::future::join_all(requested_nodes.map(|conn| async move {
-                let mut conn: C = conn.1.await;
-                conn.req_packed_command(&slot_cmd()).await
-            }))
-            .await;
-        let topology_values: Vec<_> = topology_join_results
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+            std::cmp::max(fast_math::log2_raw(read_guard.len() as f32) as usize, 1);
+        let (topology_values, failed_connections) = Self::get_topology_values_and_failed_conn(
+            &read_guard,
+            num_of_nodes_to_query,
+            ConnectionType::Management,
+        )
+        .await;
+        if topology_values.is_empty() && !failed_connections.is_empty() {
+            // Couldn't get any topology views and failed connections were found.
+            // Return to the caller to refresh failed connections
+            return Ok((TopologyRefresh::Unrequired, failed_connections));
+        }
         let (_, found_topology_hash) = calculate_topology(
             topology_values,
             DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES,
@@ -829,8 +889,13 @@ where
             num_of_nodes_to_query,
             inner.cluster_params.read_from_replicas,
         )?;
-        let change_found = read_guard.get_current_topology_hash() != found_topology_hash;
-        Ok(change_found)
+        let topology_refresh_state =
+            if read_guard.get_current_topology_hash() != found_topology_hash {
+                TopologyRefresh::Required
+            } else {
+                TopologyRefresh::Unrequired
+            };
+        Ok((topology_refresh_state, failed_connections))
     }
 
     // Query a node to discover slot-> master mappings
@@ -840,26 +905,43 @@ where
         let num_of_nodes = read_guard.len();
         const MAX_REQUESTED_NODES: usize = 50;
         let num_of_nodes_to_query = std::cmp::min(num_of_nodes, MAX_REQUESTED_NODES);
-        let requested_nodes =
-            read_guard.random_connections(num_of_nodes_to_query, ConnectionType::User);
-        let topology_join_results =
-            futures::future::join_all(requested_nodes.map(|conn| async move {
-                let mut conn: C = conn.1.await;
-                conn.req_packed_command(&slot_cmd()).await
-            }))
-            .await;
-        let topology_values: Vec<_> = topology_join_results
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
-        let (new_slots, topology_hash) = calculate_topology(
+        let conn_type = if inner.cluster_params.management_connections_enabled() {
+            ConnectionType::Management
+        } else {
+            ConnectionType::User
+        };
+        let (topology_values, failed_connections) = Self::get_topology_values_and_failed_conn(
+            &read_guard,
+            num_of_nodes_to_query,
+            conn_type.clone(),
+        )
+        .await;
+        let (new_slots, topology_hash) = match calculate_topology(
             topology_values,
             curr_retry,
             inner.cluster_params.tls,
             num_of_nodes_to_query,
             inner.cluster_params.read_from_replicas,
-        )?;
-        info!("Found slot map: {new_slots}");
+        ) {
+            Ok(res) => res,
+            Err(err) => {
+                if !failed_connections.is_empty() {
+                    // Try to refresh failed connections
+                    let _res = ClusterConnInner::refresh_connections(
+                        inner.clone(),
+                        failed_connections,
+                        if let ConnectionType::User = conn_type {
+                            RefreshConnectionType::OnlyUserConnection
+                        } else {
+                            RefreshConnectionType::OnlyManagementConnection
+                        },
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+        };
+        info!("Found slot map: {new_slots:?}");
         let connections = &*read_guard;
         // Create a new connection vector of the found nodes
         let mut nodes = new_slots.values().flatten().collect::<Vec<_>>();
@@ -899,14 +981,16 @@ where
         let new_connections: ConnectionMap<C> = stream::iter(addresses_and_connections_iter)
             .fold(
                 ConnectionsMap(HashMap::with_capacity(nodes_len)),
-                |mut connections, (addr, connection)| async {
-                    let conn =
-                        Self::get_or_create_conn(addr, connection, &inner.cluster_params).await;
-                    if let Ok((conn, ip)) = conn {
-                        connections.0.insert(
-                            addr.into(),
-                            ClusterNode::new(async { conn }.boxed().shared(), None, ip),
-                        );
+                |mut connections, (addr, node)| async {
+                    let conn = Self::get_or_create_conn(
+                        addr,
+                        &inner.cluster_params,
+                        RefreshConnectionType::AllConfiguredConnections,
+                        node,
+                    )
+                    .await;
+                    if let Ok(node) = conn {
+                        connections.0.insert(addr.into(), node);
                     }
                     connections
                 },
@@ -1139,20 +1223,22 @@ where
                 Some((identifier, connection.await))
             }
             ConnectionCheck::OnlyAddress(addr) => {
-                match connect_and_check::<C>(&addr, core.cluster_params.clone(), None).await {
-                    Ok((connection, ip)) => {
-                        let connection_clone = connection.clone();
+                match connect_and_check::<C>(
+                    &addr,
+                    core.cluster_params.clone(),
+                    None,
+                    RefreshConnectionType::AllConfiguredConnections,
+                    None,
+                )
+                .await
+                {
+                    Ok(node) => {
+                        let connection_clone = node.user_connection.clone();
                         let mut connections = core.conn_lock.write().await;
-                        let identifier = connections.replace_or_add_connection_for_address(
-                            addr,
-                            ClusterNode::new(
-                                async move { connection_clone.clone() }.boxed().shared(),
-                                None,
-                                ip,
-                            ),
-                        );
+                        let identifier =
+                            connections.replace_or_add_connection_for_address(addr, node);
                         drop(connections);
-                        Some((identifier, connection))
+                        Some((identifier, connection_clone.await))
                     }
                     Err(_) => None, // TODO - this should probably be handled in another way, not sent to a random connection.
                 }
@@ -1329,22 +1415,31 @@ where
 
     async fn get_or_create_conn(
         addr: &str,
-        node: Option<AsyncClusterNode<C>>,
         params: &ClusterParams,
-    ) -> RedisResult<(C, Option<IpAddr>)> {
+        conn_type: RefreshConnectionType,
+        node: Option<AsyncClusterNode<C>>,
+    ) -> RedisResult<AsyncClusterNode<C>> {
         if let Some(node) = node {
-            let mut conn = node.user_connection.await;
             if let Some(ref ip) = node.ip {
                 if Self::is_dns_changed(addr, ip).await {
-                    return connect_and_check(addr, params.clone(), None).await;
+                    return connect_and_check(
+                        addr,
+                        params.clone(),
+                        None,
+                        RefreshConnectionType::AllConfiguredConnections,
+                        None,
+                    )
+                    .await;
                 }
             };
-            match check_connection(&mut conn, params.connection_timeout.into()).await {
-                Ok(_) => Ok((conn, node.ip)),
-                Err(_) => connect_and_check(addr, params.clone(), None).await,
+            match check_node_connections(&node, params, conn_type).await {
+                Ok(_) => Ok(node),
+                Err(_err) => {
+                    connect_and_check(addr, params.clone(), None, conn_type, Some(node)).await
+                }
             }
         } else {
-            connect_and_check(addr, params.clone(), None).await
+            connect_and_check(addr, params.clone(), None, conn_type, None).await
         }
     }
 }
@@ -1460,7 +1555,11 @@ where
                     }
                     PollFlushAction::Reconnect(identifiers) => {
                         self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
-                            self.refresh_connections(identifiers),
+                            ClusterConnInner::refresh_connections(
+                                self.inner.clone(),
+                                identifiers,
+                                RefreshConnectionType::OnlyUserConnection,
+                            ),
                         )));
                     }
                 },
@@ -1561,6 +1660,77 @@ impl Connect for MultiplexedConnection {
 }
 
 async fn connect_and_check<C>(
+    addr: &str,
+    params: ClusterParams,
+    socket_addr: Option<SocketAddr>,
+    conn_type: RefreshConnectionType,
+    node: Option<AsyncClusterNode<C>>,
+) -> RedisResult<AsyncClusterNode<C>>
+where
+    C: ConnectionLike + Connect + Send + Sync + 'static + Clone,
+{
+    match conn_type {
+        RefreshConnectionType::OnlyUserConnection => {
+            let (user_conn, ip) = create_user_connection(addr, params.clone(), socket_addr).await?;
+            let management_conn = node.and_then(|node| node.management_connection.clone());
+
+            Ok(AsyncClusterNode::new(
+                async { user_conn }.boxed().shared(),
+                management_conn,
+                ip,
+            ))
+        }
+        RefreshConnectionType::OnlyManagementConnection => {
+            if let Some(node) = node {
+                let (management_conn, ip): (C, Option<IpAddr>) =
+                    create_management_connection(addr, params.clone(), socket_addr).await?;
+                Ok(AsyncClusterNode::new(
+                    node.user_connection.clone(),
+                    Some(async { management_conn }.boxed().shared()),
+                    ip,
+                ))
+            } else {
+                // If we do not have a relevant node for this address, it indicates that it has already been removed from the connections container.
+                // We shall fail the management connection creation.
+                Err(RedisError::from((
+                    ErrorKind::IoError,
+                    "Node {:?} were already removed from the connection map,
+                        skipping management connection creation",
+                    addr.to_string(),
+                )))
+            }
+        }
+        RefreshConnectionType::AllConfiguredConnections => {
+            let (user_conn, ip) = create_user_connection(addr, params.clone(), socket_addr).await?;
+            let management_conn = if params.management_connections_enabled() {
+                let (management_conn, management_ip): (C, Option<IpAddr>) =
+                    create_management_connection(addr, params.clone(), socket_addr).await?;
+
+                if management_ip != ip {
+                    return Err(RedisError::from((
+                        ErrorKind::IoError,
+                        "Failed to create all configured connections",
+                        format!(
+                            "The management and user connection IPs are different for node {:?}: 
+                            management connection IP = {:?}, user connection IP = {:?}",
+                            addr, management_ip, ip
+                        ),
+                    )));
+                }
+                Some(async { management_conn }.boxed().shared())
+            } else {
+                None
+            };
+            Ok(AsyncClusterNode::new(
+                async { user_conn }.boxed().shared(),
+                management_conn,
+                ip,
+            ))
+        }
+    }
+}
+
+async fn create_user_connection<C>(
     node: &str,
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
@@ -1571,10 +1741,7 @@ where
     let read_from_replicas = params.read_from_replicas
         != crate::cluster_topology::ReadFromReplicaStrategy::AlwaysFromPrimary;
     let connection_timeout = params.connection_timeout.into();
-    let info = get_connection_info(node, params)?;
-    let (mut conn, ip) = C::connect(info, socket_addr)
-        .timeout(connection_timeout)
-        .await??;
+    let (mut conn, ip) = create_connection(node, params, socket_addr).await?;
     check_connection(&mut conn, connection_timeout).await?;
     if read_from_replicas {
         // If READONLY is sent to primary nodes, it will have no effect
@@ -1583,11 +1750,81 @@ where
     Ok((conn, ip))
 }
 
+async fn create_management_connection<C>(
+    node: &str,
+    params: ClusterParams,
+    socket_addr: Option<SocketAddr>,
+) -> RedisResult<(C, Option<IpAddr>)>
+where
+    C: ConnectionLike + Connect + Send + 'static,
+{
+    let (mut conn, ip) = create_connection(node, params, socket_addr).await?;
+    crate::cmd("CLIENT")
+        .arg(&["SETNAME", MANAGEMENT_CONN_NAME])
+        .query_async(&mut conn)
+        .await?;
+    Ok((conn, ip))
+}
+
+async fn create_connection<C>(
+    node: &str,
+    params: ClusterParams,
+    socket_addr: Option<SocketAddr>,
+) -> RedisResult<(C, Option<IpAddr>)>
+where
+    C: ConnectionLike + Connect + Send + 'static,
+{
+    let connection_timeout: futures_time::time::Duration = params.connection_timeout.into();
+    let info = get_connection_info(node, params)?;
+    C::connect(info, socket_addr)
+        .timeout(connection_timeout)
+        .await?
+}
+
+async fn check_node_connections<C>(
+    node: &AsyncClusterNode<C>,
+    params: &ClusterParams,
+    conn_type: RefreshConnectionType,
+) -> RedisResult<()>
+where
+    C: ConnectionLike + Send + 'static + Clone,
+{
+    let timeout = params.connection_timeout.into();
+    match conn_type {
+        RefreshConnectionType::OnlyUserConnection => {
+            let mut user_conn = node.user_connection.clone().await;
+            check_connection(&mut user_conn, timeout).await
+        }
+        RefreshConnectionType::OnlyManagementConnection => {
+            let mut management_conn = node
+                .management_connection
+                .clone()
+                .ok_or(RedisError::from((
+                    ErrorKind::IoError,
+                    "Couldn't find mangement connection for node {:?}",
+                    node.ip.map_or("".to_string(), |ip| ip.to_string()),
+                )))?
+                .await;
+            check_connection(&mut management_conn, timeout).await
+        }
+        RefreshConnectionType::AllConfiguredConnections => {
+            let mut user_conn = node.user_connection.clone().await;
+            check_connection(&mut user_conn, timeout).await?;
+            if params.management_connections_enabled() {
+                if let Some(management_conn_option) = node.management_connection.clone() {
+                    let mut management_conn = management_conn_option.await;
+                    return check_connection(&mut management_conn, timeout).await;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn check_connection<C>(conn: &mut C, timeout: futures_time::time::Duration) -> RedisResult<()>
 where
     C: ConnectionLike + Send + 'static,
 {
-    // TODO: Add a check to re-resolve DNS addresses to verify we that we have a connection to the right node
     crate::cmd("PING")
         .query_async::<_, String>(conn)
         .timeout(timeout)
