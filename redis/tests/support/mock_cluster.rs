@@ -114,7 +114,7 @@ pub fn contains_slice(xs: &[u8], ys: &[u8]) -> bool {
 }
 
 pub fn respond_startup(name: &str, cmd: &[u8]) -> Result<(), RedisResult<Value>> {
-    if contains_slice(cmd, b"PING") {
+    if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
         Err(Ok(Value::SimpleString("OK".into())))
     } else if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
         Err(Ok(Value::Array(vec![Value::Array(vec![
@@ -203,7 +203,7 @@ pub fn respond_startup_with_replica_using_config(
             slot_range: (8192..16383),
         },
     ]);
-    if contains_slice(cmd, b"PING") {
+    if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
         Err(Ok(Value::SimpleString("OK".into())))
     } else if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
         let slots = create_topology_from_config(name, slots_config);

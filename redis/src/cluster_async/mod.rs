@@ -38,6 +38,8 @@ use std::{
     task::{self, Poll},
 };
 
+#[cfg(not(feature = "tls-rustls"))]
+use crate::connection::TlsConnParams;
 use crate::{
     aio::{get_socket_addrs, ConnectionLike, MultiplexedConnection},
     cluster::{get_connection_info, slot_cmd},
@@ -54,10 +56,8 @@ use crate::{
     Cmd, ConnectionInfo, ErrorKind, IntoConnectionInfo, RedisError, RedisFuture, RedisResult,
     Value,
 };
+use rand::{thread_rng, Rng};
 use std::time::Duration;
-
-#[cfg(not(feature = "tls-rustls"))]
-use crate::connection::TlsConnParams;
 
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use crate::aio::{async_std::AsyncStd, RedisRuntime};
@@ -501,15 +501,14 @@ enum ConnectionCheck<C> {
     Nothing,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RefreshConnectionType {
     // Refresh only user connections
     OnlyUserConnection,
     // Refresh only management connections
     OnlyManagementConnection,
-    // Refresh all configured connections: user connections for client with disabled management connections or
-    // both management and user connections when enabled.
-    AllConfiguredConnections,
+    // Refresh all connections: both management and user connections.
+    AllConnections,
 }
 
 impl<C> ClusterConnInner<C>
@@ -612,7 +611,7 @@ where
                         &node_addr,
                         params,
                         socket_addr,
-                        RefreshConnectionType::AllConfiguredConnections,
+                        RefreshConnectionType::AllConnections,
                         None,
                     )
                     .await;
@@ -667,6 +666,25 @@ where
                     let addr_option = connections_container.address_for_identifier(&identifier);
                     let node_option = connections_container.remove_node(&identifier);
                     if let Some(addr) = addr_option {
+                        let conn_type = if node_option.is_none()
+                            && conn_type == RefreshConnectionType::OnlyUserConnection
+                        {
+                            // If we do not have a relevant node for this address, it indicates that it's a new node. All connection types should be refreshed.
+                            RefreshConnectionType::AllConnections
+                        } else if node_option.is_none()
+                            && conn_type == RefreshConnectionType::OnlyManagementConnection
+                        {
+                            // If we do not have a relevant node for this address and it was called from management connection job,
+                            // it indicates that this node has already been removed from the connections container and we shall not create a management connection for it.
+                            info!(
+                                "Node {:?} were already removed from the connection map,
+                                            skipping management connection creation",
+                                addr.to_string()
+                            );
+                            return connections_container;
+                        } else {
+                            conn_type
+                        };
                         let conn =
                             Self::get_or_create_conn(&addr, cluster_params, conn_type, node_option)
                                 .await;
@@ -678,6 +696,7 @@ where
                 },
             )
             .await;
+        info!("refresh connections completed");
     }
 
     async fn aggregate_results(
@@ -793,10 +812,18 @@ where
         interval_duration: Duration,
         shutdown_flag: Arc<AtomicBool>,
     ) {
+        const MAX_JITTER_MILLI: u64 = 1000;
+        let mut jitter: u64;
         loop {
             if shutdown_flag.load(Ordering::Relaxed) {
                 return;
             }
+            // To avoid server overload or connection storms when multiple clients are present, we'll add a jitter to the interval duration
+            {
+                let mut rng: rand::prelude::ThreadRng = thread_rng();
+                jitter = rng.gen_range(0..MAX_JITTER_MILLI);
+            }
+            let interval_duration = interval_duration + Duration::from_millis(jitter);
             let _ = sleep(interval_duration.into()).await;
 
             let retry_strategy = ExponentialBackoff {
@@ -808,8 +835,8 @@ where
                 Self::check_for_topology_diff(inner.clone()).map_err(Error::from)
             })
             .await;
-            if let Ok((refresh_state, failed_connections)) = topology_check_res {
-                match refresh_state {
+            match topology_check_res {
+                Ok((refresh_state, failed_connections)) => match refresh_state {
                     TopologyRefresh::Required => {
                         info!("Topology change found, starting to refresh slots");
                         let _ = Self::refresh_slots_with_retries(inner.clone()).await;
@@ -824,7 +851,11 @@ where
                             .await;
                         }
                     }
-                }
+                },
+                Err(err) => warn!(
+                    "The periodic topology check failed to get topology with error: {:?}",
+                    err
+                ),
             }
         }
     }
@@ -851,6 +882,7 @@ where
             match result {
                 Ok(res) => topology_values.push(res),
                 Err(err) => {
+                    warn!("Received an error while attempting to retrieve the topology view of connection with identifier {:?}:\n{:?}", identifier, err);
                     if err.is_connection_dropped() {
                         failed_connections.push(identifier);
                     }
@@ -905,15 +937,10 @@ where
         let num_of_nodes = read_guard.len();
         const MAX_REQUESTED_NODES: usize = 50;
         let num_of_nodes_to_query = std::cmp::min(num_of_nodes, MAX_REQUESTED_NODES);
-        let conn_type = if inner.cluster_params.management_connections_enabled() {
-            ConnectionType::Management
-        } else {
-            ConnectionType::User
-        };
         let (topology_values, failed_connections) = Self::get_topology_values_and_failed_conn(
             &read_guard,
             num_of_nodes_to_query,
-            conn_type.clone(),
+            ConnectionType::Management,
         )
         .await;
         let (new_slots, topology_hash) = match calculate_topology(
@@ -930,18 +957,14 @@ where
                     let _res = ClusterConnInner::refresh_connections(
                         inner.clone(),
                         failed_connections,
-                        if let ConnectionType::User = conn_type {
-                            RefreshConnectionType::OnlyUserConnection
-                        } else {
-                            RefreshConnectionType::OnlyManagementConnection
-                        },
+                        RefreshConnectionType::OnlyManagementConnection,
                     )
                     .await;
                 }
                 return Err(err);
             }
         };
-        info!("Found slot map: {new_slots:?}");
+        info!("Found slot map: {new_slots}");
         let connections = &*read_guard;
         // Create a new connection vector of the found nodes
         let mut nodes = new_slots.values().flatten().collect::<Vec<_>>();
@@ -985,7 +1008,7 @@ where
                     let conn = Self::get_or_create_conn(
                         addr,
                         &inner.cluster_params,
-                        RefreshConnectionType::AllConfiguredConnections,
+                        RefreshConnectionType::AllConnections,
                         node,
                     )
                     .await;
@@ -1227,7 +1250,7 @@ where
                     &addr,
                     core.cluster_params.clone(),
                     None,
-                    RefreshConnectionType::AllConfiguredConnections,
+                    RefreshConnectionType::AllConnections,
                     None,
                 )
                 .await
@@ -1426,15 +1449,15 @@ where
                         addr,
                         params.clone(),
                         None,
-                        RefreshConnectionType::AllConfiguredConnections,
+                        RefreshConnectionType::AllConnections,
                         None,
                     )
                     .await;
                 }
             };
             match check_node_connections(&node, params, conn_type).await {
-                Ok(_) => Ok(node),
-                Err(_err) => {
+                None => Ok(node),
+                Some(conn_type) => {
                     connect_and_check(addr, params.clone(), None, conn_type, Some(node)).await
                 }
             }
@@ -1671,60 +1694,47 @@ where
 {
     match conn_type {
         RefreshConnectionType::OnlyUserConnection => {
+            // `node` is guaranteed not to be None
+            let node = node.unwrap();
             let (user_conn, ip) = create_user_connection(addr, params.clone(), socket_addr).await?;
-            let management_conn = node.and_then(|node| node.management_connection.clone());
-
             Ok(AsyncClusterNode::new(
                 async { user_conn }.boxed().shared(),
-                management_conn,
+                node.management_connection.clone(),
                 ip,
             ))
         }
         RefreshConnectionType::OnlyManagementConnection => {
-            if let Some(node) = node {
-                let (management_conn, ip): (C, Option<IpAddr>) =
-                    create_management_connection(addr, params.clone(), socket_addr).await?;
-                Ok(AsyncClusterNode::new(
-                    node.user_connection.clone(),
-                    Some(async { management_conn }.boxed().shared()),
-                    ip,
-                ))
-            } else {
-                // If we do not have a relevant node for this address, it indicates that it has already been removed from the connections container.
-                // We shall fail the management connection creation.
-                Err(RedisError::from((
-                    ErrorKind::IoError,
-                    "Node {:?} were already removed from the connection map,
-                        skipping management connection creation",
-                    addr.to_string(),
-                )))
-            }
+            // `node` is guaranteed not to be None
+            let node = node.unwrap();
+            let (management_conn, ip): (C, Option<IpAddr>) =
+                create_management_connection(addr, params.clone(), socket_addr).await?;
+            Ok(AsyncClusterNode::new(
+                node.user_connection.clone(),
+                async { management_conn }.boxed().shared(),
+                ip,
+            ))
         }
-        RefreshConnectionType::AllConfiguredConnections => {
-            let (user_conn, ip) = create_user_connection(addr, params.clone(), socket_addr).await?;
-            let management_conn = if params.management_connections_enabled() {
-                let (management_conn, management_ip): (C, Option<IpAddr>) =
-                    create_management_connection(addr, params.clone(), socket_addr).await?;
-
-                if management_ip != ip {
-                    return Err(RedisError::from((
-                        ErrorKind::IoError,
-                        "Failed to create all configured connections",
-                        format!(
-                            "The management and user connection IPs are different for node {:?}: 
+        RefreshConnectionType::AllConnections => {
+            let (user_conn, user_ip) =
+                create_user_connection(addr, params.clone(), socket_addr).await?;
+            let (management_conn, management_ip) =
+                create_management_connection(addr, params.clone(), socket_addr).await?;
+            if management_ip != user_ip {
+                return Err(RedisError::from((
+                    ErrorKind::IoError,
+                    "Failed to refresh all connections",
+                    format!(
+                        "The management and user connection IPs are different for node {:?}: 
                             management connection IP = {:?}, user connection IP = {:?}",
-                            addr, management_ip, ip
-                        ),
-                    )));
-                }
-                Some(async { management_conn }.boxed().shared())
-            } else {
-                None
-            };
+                        addr, management_ip, user_ip
+                    ),
+                )));
+            }
+
             Ok(AsyncClusterNode::new(
                 async { user_conn }.boxed().shared(),
-                management_conn,
-                ip,
+                async { management_conn }.boxed().shared(),
+                user_ip,
             ))
         }
     }
@@ -1781,11 +1791,12 @@ where
         .await?
 }
 
+/// The function returns None if the checked connection/s are healthy. Otherwise, it returns the type of the unhealthy connection/s.
 async fn check_node_connections<C>(
     node: &AsyncClusterNode<C>,
     params: &ClusterParams,
     conn_type: RefreshConnectionType,
-) -> RedisResult<()>
+) -> Option<RefreshConnectionType>
 where
     C: ConnectionLike + Send + 'static + Clone,
 {
@@ -1793,30 +1804,56 @@ where
     match conn_type {
         RefreshConnectionType::OnlyUserConnection => {
             let mut user_conn = node.user_connection.clone().await;
-            check_connection(&mut user_conn, timeout).await
-        }
-        RefreshConnectionType::OnlyManagementConnection => {
-            let mut management_conn = node
-                .management_connection
-                .clone()
-                .ok_or(RedisError::from((
-                    ErrorKind::IoError,
-                    "Couldn't find mangement connection for node {:?}",
-                    node.ip.map_or("".to_string(), |ip| ip.to_string()),
-                )))?
-                .await;
-            check_connection(&mut management_conn, timeout).await
-        }
-        RefreshConnectionType::AllConfiguredConnections => {
-            let mut user_conn = node.user_connection.clone().await;
-            check_connection(&mut user_conn, timeout).await?;
-            if params.management_connections_enabled() {
-                if let Some(management_conn_option) = node.management_connection.clone() {
-                    let mut management_conn = management_conn_option.await;
-                    return check_connection(&mut management_conn, timeout).await;
+            match check_connection(&mut user_conn, timeout).await {
+                Ok(_) => None,
+                Err(err) => {
+                    warn!(
+                        "The user connection for node {:?} is unhealthy. Error: {:?}",
+                        node, err
+                    );
+                    Some(conn_type)
                 }
             }
-            Ok(())
+        }
+        RefreshConnectionType::OnlyManagementConnection => {
+            let mut management_conn = node.management_connection.clone().await;
+            match check_connection(&mut management_conn, timeout).await {
+                Ok(_) => None,
+                Err(err) => {
+                    warn!(
+                        "The management connection for node {:?} is unhealthy. Error: {:?}",
+                        node, err
+                    );
+                    Some(conn_type)
+                }
+            }
+        }
+        RefreshConnectionType::AllConnections => {
+            let mut user_conn = node.user_connection.clone().await;
+            let user_conn_state = check_connection(&mut user_conn, timeout).await;
+            let mut management_conn = node.management_connection.clone().await;
+            let management_conn_state = check_connection(&mut management_conn, timeout).await;
+            if user_conn_state.is_err() && management_conn_state.is_err() {
+                warn!(
+                    "Both the management and user connections for node {:?} are unhealthy. Errors:\n{:?}\n{:?}",
+                    node, user_conn_state, management_conn_state
+                );
+                Some(RefreshConnectionType::AllConnections)
+            } else if user_conn_state.is_err() {
+                warn!(
+                    "The user connection for node {:?} is unhealthy. Error: {:?}",
+                    node, user_conn_state
+                );
+                Some(RefreshConnectionType::OnlyUserConnection)
+            } else if management_conn_state.is_err() {
+                warn!(
+                    "The management connection for node {:?} is unhealthy. Error: {:?}",
+                    node, management_conn_state
+                );
+                Some(RefreshConnectionType::OnlyManagementConnection)
+            } else {
+                None
+            }
         }
     }
 }

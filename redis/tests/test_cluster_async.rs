@@ -607,7 +607,7 @@ fn test_async_cluster_move_error_when_new_node_is_added() {
         }
         started.store(true, atomic::Ordering::SeqCst);
 
-        if contains_slice(cmd, b"PING") {
+        if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
             return Err(Ok(Value::SimpleString("OK".into())));
         }
 
@@ -771,7 +771,7 @@ fn test_cluster_refresh_topology_in_client_init_get_succeed(
         move |cmd: &[u8], port| {
             let is_started = started.load(atomic::Ordering::SeqCst);
             if !is_started {
-                if contains_slice(cmd, b"PING") {
+                if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
                     return Err(Ok(Value::SimpleString("OK".into())));
                 } else if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
                     let view_index = get_node_view_index(slots_config_vec.len(), &ports, port);
@@ -1009,7 +1009,7 @@ fn test_async_cluster_ask_error_when_new_node_is_added() {
         }
         started.store(true, atomic::Ordering::SeqCst);
 
-        if contains_slice(cmd, b"PING") {
+        if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
             return Err(Ok(Value::SimpleString("OK".into())));
         }
 
@@ -2072,9 +2072,12 @@ mod mtls_test {
 }
 #[test]
 fn test_async_cluster_periodic_checks_use_management_connection() {
-    let cluster = TestClusterContext::new_with_cluster_client_builder(3, 0, |builder| {
-        builder.periodic_topology_checks(Duration::from_millis(100))
-    });
+    let cluster = TestClusterContext::new_with_cluster_client_builder(
+        3,
+        0,
+        |builder| builder.periodic_topology_checks(Duration::from_millis(100)),
+        false,
+    );
 
     block_on_all(async move {
         let mut connection = cluster.async_connection().await;
@@ -2124,9 +2127,12 @@ fn test_async_cluster_only_management_connection_is_reconnected_after_connection
     // This test will check two aspects:
     // 1. Ensuring that after a disconnection in the management connection, a new management connection is established.
     // 2. Confirming that a failure in the management connection does not impact the user connection, which should remain intact.
-    let cluster = TestClusterContext::new_with_cluster_client_builder(3, 0, |builder| {
-        builder.periodic_topology_checks(Duration::from_millis(100))
-    });
+    let cluster = TestClusterContext::new_with_cluster_client_builder(
+        3,
+        0,
+        |builder| builder.periodic_topology_checks(Duration::from_millis(100)),
+        false,
+    );
     block_on_all(async move {
         let mut connection = cluster.async_connection().await;
         let _client_list = "".to_string();
@@ -2218,23 +2224,6 @@ fn test_async_cluster_only_management_connection_is_reconnected_after_connection
             \nprev_management_conn_id={:?},prev_user_conn_id={:?}\nclient list={:?}",
             management_conn_id, user_conn_id, client_list
         );
-    })
-    .unwrap();
-}
-
-#[test]
-fn test_async_cluster_management_connection_isnt_being_created_when_periodic_checks_disabled() {
-    let cluster = TestClusterContext::new(3, 0);
-    block_on_all(async move {
-        let mut connection = cluster.async_connection().await;
-        let client_list: String = cmd("CLIENT")
-            .arg("LIST")
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        eprintln!("{client_list}");
-        assert!(!client_list.contains(MANAGEMENT_CONN_NAME));
-        Ok::<_, RedisError>(())
     })
     .unwrap();
 }
