@@ -37,6 +37,7 @@ where
             ConnectionType::User => self.user_connection.clone(),
             ConnectionType::PreferManagement => self
                 .management_connection
+                .clone()
                 .unwrap_or_else(|| self.user_connection.clone()),
         }
     }
@@ -631,7 +632,7 @@ mod tests {
     fn get_random_management_connections() {
         let container = create_container_with_strategy(ReadFromReplicaStrategy::RoundRobin);
         let mut random_connections: Vec<_> = container
-            .random_connections(1000, ConnectionType::Management)
+            .random_connections(1000, ConnectionType::PreferManagement)
             .map(|pair| pair.1)
             .collect();
         random_connections.sort();
