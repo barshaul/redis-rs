@@ -12,7 +12,7 @@ type IdentifierType = ArcStr;
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct ClusterNode<Connection> {
     pub user_connection: Connection,
-    pub management_connection: Connection,
+    pub management_connection: Option<Connection>,
     pub ip: Option<IpAddr>,
 }
 
@@ -22,7 +22,7 @@ where
 {
     pub(crate) fn new(
         user_connection: Connection,
-        management_connection: Connection,
+        management_connection: Option<Connection>,
         ip: Option<IpAddr>,
     ) -> Self {
         Self {
@@ -35,7 +35,9 @@ where
     pub(crate) fn get_connection(&self, conn_type: &ConnectionType) -> Connection {
         match conn_type {
             ConnectionType::User => self.user_connection.clone(),
-            ConnectionType::Management => self.management_connection.clone(),
+            ConnectionType::PreferManagement => self
+                .management_connection
+                .unwrap_or_else(|| self.user_connection.clone()),
         }
     }
 }
@@ -43,7 +45,7 @@ where
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) enum ConnectionType {
     User,
-    Management,
+    PreferManagement,
 }
 
 /// This opaque type allows us to change the way that the connections are organized
@@ -312,7 +314,7 @@ mod tests {
     }
 
     fn create_cluster_node(connection: usize) -> Option<ClusterNode<usize>> {
-        Some(ClusterNode::new(connection, connection * 10, None))
+        Some(ClusterNode::new(connection, Some(connection * 10), None))
     }
 
     fn create_container_with_strategy(

@@ -131,7 +131,6 @@ pub enum ErrorKind {
     EmptySentinelList,
     /// Attempted to kill a script/function while they werent' executing
     NotBusy,
-
     #[cfg(feature = "json")]
     /// Error Serializing a struct to JSON form
     Serialize,
@@ -139,6 +138,8 @@ pub enum ErrorKind {
     /// Redis Servers prior to v6.0.0 doesn't support RESP3.
     /// Try disabling resp3 option
     RESP3NotSupported,
+    /// The management connection isn't set
+    NoneManagementConn,
 }
 
 /// Internal low-level redis value enum.
@@ -624,6 +625,7 @@ impl RedisError {
             #[cfg(feature = "json")]
             ErrorKind::Serialize => "serializing",
             ErrorKind::RESP3NotSupported => "resp3 is not supported by server",
+            ErrorKind::NoneManagementConn => "the management connection isn't set",
         }
     }
 
@@ -776,6 +778,7 @@ impl RedisError {
             #[cfg(feature = "json")]
             ErrorKind::Serialize => false,
             ErrorKind::RESP3NotSupported => false,
+            ErrorKind::NoneManagementConn => false,
         }
     }
 }

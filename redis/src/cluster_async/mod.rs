@@ -303,7 +303,7 @@ struct Message<C> {
 
 enum RecoverFuture {
     RecoverSlots(BoxFuture<'static, RedisResult<()>>),
-    Reconnect(BoxFuture<'static, ()>),
+    Reconnect(BoxFuture<'static, Vec<ConnectionIdentifier>>),
 }
 
 enum ConnectionState {
@@ -655,14 +655,14 @@ where
         inner: Arc<InnerCore<C>>,
         identifiers: Vec<ConnectionIdentifier>,
         conn_type: RefreshConnectionType,
-    ) {
+    ) -> Vec<connections_container::Identifier> {
         info!("Started refreshing connections to {:?}", identifiers);
         let mut connections_container = inner.conn_lock.write().await;
         let cluster_params = &inner.cluster_params;
-        stream::iter(identifiers.into_iter())
+        let (_, failed_connections) = stream::iter(identifiers.into_iter())
             .fold(
-                &mut *connections_container,
-                |connections_container, identifier| async move {
+                (&mut *connections_container, Vec::new()),
+                |(connections_container, mut failed_connections), identifier| async move {
                     let addr_option = connections_container.address_for_identifier(&identifier);
                     let node_option = connections_container.remove_node(&identifier);
                     if let Some(addr) = addr_option {
@@ -681,7 +681,7 @@ where
                                             skipping management connection creation",
                                 addr.to_string()
                             );
-                            return connections_container;
+                            return (connections_container, failed_connections);
                         } else {
                             conn_type
                         };
@@ -690,13 +690,16 @@ where
                                 .await;
                         if let Ok(node) = conn {
                             connections_container.replace_or_add_connection_for_address(addr, node);
+                        } else {
+                            failed_connections.push(identifier);
                         }
                     }
-                    connections_container
+                    (connections_container, failed_connections)
                 },
             )
             .await;
         info!("refresh connections completed");
+        failed_connections
     }
 
     async fn aggregate_results(
@@ -814,6 +817,7 @@ where
     ) {
         const MAX_JITTER_MILLI: u64 = 1000;
         let mut jitter: u64;
+        let mut failed_identifiers = Vec::new();
         loop {
             if shutdown_flag.load(Ordering::Relaxed) {
                 return;
@@ -836,19 +840,21 @@ where
             })
             .await;
             match topology_check_res {
-                Ok((refresh_state, failed_connections)) => match refresh_state {
+                Ok((refresh_state, mut failed_connections)) => match refresh_state {
                     TopologyRefresh::Required => {
                         info!("Topology change found, starting to refresh slots");
                         let _ = Self::refresh_slots_with_retries(inner.clone()).await;
                     }
                     TopologyRefresh::Unrequired => {
+                        failed_connections.append(&mut failed_identifiers);
                         if !failed_connections.is_empty() {
-                            let _res = Self::refresh_connections(
+                            let mut new_failed_identifiers = Self::refresh_connections(
                                 inner.clone(),
                                 failed_connections,
                                 RefreshConnectionType::OnlyManagementConnection,
                             )
                             .await;
+                            failed_identifiers.append(&mut new_failed_identifiers);
                         }
                     }
                 },
@@ -906,7 +912,7 @@ where
         let (topology_values, failed_connections) = Self::get_topology_values_and_failed_conn(
             &read_guard,
             num_of_nodes_to_query,
-            ConnectionType::Management,
+            ConnectionType::PreferManagement,
         )
         .await;
         if topology_values.is_empty() && !failed_connections.is_empty() {
@@ -940,7 +946,7 @@ where
         let (topology_values, failed_connections) = Self::get_topology_values_and_failed_conn(
             &read_guard,
             num_of_nodes_to_query,
-            ConnectionType::Management,
+            ConnectionType::PreferManagement,
         )
         .await;
         let (new_slots, topology_hash) = match calculate_topology(
@@ -1710,7 +1716,7 @@ where
                 create_management_connection(addr, params.clone(), socket_addr).await?;
             Ok(AsyncClusterNode::new(
                 node.user_connection.clone(),
-                async { management_conn }.boxed().shared(),
+                Some(async { management_conn }.boxed().shared()),
                 ip,
             ))
         }
@@ -1733,7 +1739,7 @@ where
 
             Ok(AsyncClusterNode::new(
                 async { user_conn }.boxed().shared(),
-                async { management_conn }.boxed().shared(),
+                Some(async { management_conn }.boxed().shared()),
                 user_ip,
             ))
         }
@@ -1801,6 +1807,15 @@ where
     C: ConnectionLike + Send + 'static + Clone,
 {
     let timeout = params.connection_timeout.into();
+    let management_conn_state = async {
+        match node.management_connection.clone() {
+            Some(conn) => check_connection(&mut conn.await, timeout).await,
+            None => Err(RedisError::from((
+                ErrorKind::NoneManagementConn,
+                "The management connection isn't set",
+            ))),
+        }
+    };
     match conn_type {
         RefreshConnectionType::OnlyUserConnection => {
             let mut user_conn = node.user_connection.clone().await;
@@ -1811,48 +1826,46 @@ where
                         "The user connection for node {:?} is unhealthy. Error: {:?}",
                         node, err
                     );
-                    Some(conn_type)
+                    Some(RefreshConnectionType::OnlyUserConnection)
                 }
             }
         }
-        RefreshConnectionType::OnlyManagementConnection => {
-            let mut management_conn = node.management_connection.clone().await;
-            match check_connection(&mut management_conn, timeout).await {
-                Ok(_) => None,
-                Err(err) => {
+        RefreshConnectionType::OnlyManagementConnection => match management_conn_state.await {
+            Ok(_) => None,
+            Err(err) => {
+                warn!(
+                    "The management connection for node {:?} is unhealthy. Error: {:?}",
+                    node, err
+                );
+                Some(RefreshConnectionType::OnlyManagementConnection)
+            }
+        },
+        RefreshConnectionType::AllConnections => {
+            let mut user_conn = node.user_connection.clone().await;
+            let user_conn_state = check_connection(&mut user_conn, timeout).await;
+            match (user_conn_state, management_conn_state.await) {
+                (Ok(_), Ok(_)) => None,
+                (Ok(_), Err(err)) => {
                     warn!(
                         "The management connection for node {:?} is unhealthy. Error: {:?}",
                         node, err
                     );
-                    Some(conn_type)
+                    Some(RefreshConnectionType::OnlyManagementConnection)
                 }
-            }
-        }
-        RefreshConnectionType::AllConnections => {
-            let mut user_conn = node.user_connection.clone().await;
-            let user_conn_state = check_connection(&mut user_conn, timeout).await;
-            let mut management_conn = node.management_connection.clone().await;
-            let management_conn_state = check_connection(&mut management_conn, timeout).await;
-            if user_conn_state.is_err() && management_conn_state.is_err() {
-                warn!(
-                    "Both the management and user connections for node {:?} are unhealthy. Errors:\n{:?}\n{:?}",
-                    node, user_conn_state, management_conn_state
-                );
-                Some(RefreshConnectionType::AllConnections)
-            } else if user_conn_state.is_err() {
-                warn!(
-                    "The user connection for node {:?} is unhealthy. Error: {:?}",
-                    node, user_conn_state
-                );
-                Some(RefreshConnectionType::OnlyUserConnection)
-            } else if management_conn_state.is_err() {
-                warn!(
-                    "The management connection for node {:?} is unhealthy. Error: {:?}",
-                    node, management_conn_state
-                );
-                Some(RefreshConnectionType::OnlyManagementConnection)
-            } else {
-                None
+                (Err(err), Ok(_)) => {
+                    warn!(
+                        "The user connection for node {:?} is unhealthy. Error: {:?}",
+                        node, err
+                    );
+                    Some(RefreshConnectionType::OnlyUserConnection)
+                }
+                (Err(user_err), Err(management_err)) => {
+                    warn!(
+                        "Both the management and user connections for node {:?} are unhealthy. Errors:\n{:?}\n{:?}",
+                        node, user_err, management_err
+                    );
+                    Some(RefreshConnectionType::AllConnections)
+                }
             }
         }
     }
