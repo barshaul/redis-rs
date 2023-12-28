@@ -1,7 +1,8 @@
 #![cfg(feature = "cluster-async")]
 mod support;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     atomic::{self, AtomicI32, AtomicU16},
     atomic::{AtomicBool, Ordering},
@@ -22,11 +23,11 @@ use redis::FromRedisValue;
 use redis::{
     aio::{ConnectionLike, MultiplexedConnection},
     cluster::ClusterClient,
-    cluster_async::Connect,
+    cluster_async::{connect_and_check, AsyncClusterNode, Connect, RefreshConnectionType},
     cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
     cluster_topology::{DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES, MANAGEMENT_CONN_NAME},
-    cmd, parse_redis_value, AsyncCommands, Cmd, ErrorKind, InfoDict, IntoConnectionInfo,
-    RedisError, RedisFuture, RedisResult, Script, Value,
+    cmd, parse_redis_value, AsyncCommands, ClusterParams, Cmd, ErrorKind, InfoDict,
+    IntoConnectionInfo, RedisError, RedisFuture, RedisResult, Script, Value,
 };
 use std::str::from_utf8;
 use std::time::Duration;
@@ -494,6 +495,446 @@ fn test_async_cluster_async_std_basic_cmd() {
             .await
     })
     .unwrap();
+}
+
+fn reset_mock_connection() {
+    let mut conn_utils = MOCK_CONN_UTILS.write().unwrap();
+    conn_utils.returned_ip_type = ConnectionIPReturnType::None;
+    conn_utils.return_connection_err = ShouldReturnConnectionError::No;
+}
+
+#[test]
+fn test_connect_and_check_all_connections_both_connections_ok() {
+    // Test that upon refreshing all connections, if both connections were successful,
+    // the returned node contains both user and management connection
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::AllConnections;
+    let ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().returned_ip_type = ConnectionIPReturnType::Specified(ip);
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            None,
+        )
+        .await;
+        assert!(node.is_ok() && node.unwrap().management_connection.is_some());
+        reset_mock_connection();
+    })
+}
+#[test]
+fn test_connect_and_check_all_connections_one_connection_err_returns_only_user_conn() {
+    // Test that upon refreshing all connections, if only one of the new connections fail,
+    // the other successful connection will be used as the user connection.
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+    let conn_type = RefreshConnectionType::AllConnections;
+    let params = ClusterParams::default();
+    runtime.block_on(async {
+        // The second connection will fail
+        MOCK_CONN_UTILS.write().unwrap().return_connection_err =
+            ShouldReturnConnectionError::OnOddIdx(AtomicUsize::new(0));
+        let node: RedisResult<AsyncClusterNode<MockConnection>> =
+            connect_and_check("0.0.0.0:6379", params.clone(), None, conn_type, None).await;
+        assert!(node.is_ok() && node.unwrap().management_connection.is_none());
+        // The first connection will fail
+        MOCK_CONN_UTILS.write().unwrap().return_connection_err =
+            ShouldReturnConnectionError::OnOddIdx(AtomicUsize::new(1));
+        let node: RedisResult<AsyncClusterNode<MockConnection>> =
+            connect_and_check("0.0.0.0:6379", params, None, conn_type, None).await;
+        assert!(node.is_ok() && node.unwrap().management_connection.is_none());
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_all_connections_different_ip_returns_only_user_conn() {
+    // Test that upon refreshing all connections, if the IPs of the new connections differ,
+    // the function selects only the connection with the correct IP as the user connection.
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::AllConnections;
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().returned_ip_type =
+            ConnectionIPReturnType::Different(AtomicUsize::new(0));
+        // The first connection will have 0.0.0.0 IP
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            None,
+        )
+        .await;
+        assert!(node.is_ok());
+        let node = node.unwrap();
+        assert!(node.management_connection.is_none());
+        assert!(node.ip.is_some() && node.ip.unwrap().to_string() == *"0.0.0.0");
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_all_connections_both_conn_error_returns_err() {
+    // Test that when trying to refresh all connections and both connections fail, the function returns with an error
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type: RefreshConnectionType = RefreshConnectionType::AllConnections;
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().return_connection_err = ShouldReturnConnectionError::Yes;
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            None,
+        )
+        .await;
+        assert!(node.is_err());
+        let err = node.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to refresh all connections"));
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_only_management_same_ip() {
+    // Test that when we refresh only the management connection and the new connection returned with the same IP as the user's,
+    // the returned node contains a new management connection and the user connection remains unchanged
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::OnlyManagementConnection;
+    let user_conn_id: usize = 1000;
+    let user_conn = MockConnection {
+        id: user_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+    let node = AsyncClusterNode::new(async { user_conn }.boxed().shared(), None, Some(ip));
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().returned_ip_type = ConnectionIPReturnType::Specified(ip);
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            Some(node),
+        )
+        .await;
+        assert!(node.is_ok());
+        let node = node.unwrap();
+        assert!(node.management_connection.is_some());
+        // Confirm that the user connection remains unchanged
+        assert_eq!(node.user_connection.await.id, user_conn_id);
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_only_management_different_ip_reconnects_both_connections() {
+    // Test that when we try the refresh only the management connection and a new IP is found, both connections are being replaced
+    let name = "1.1.1.1";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::OnlyManagementConnection;
+    let user_conn_id: usize = 1000;
+    let user_conn = MockConnection {
+        id: user_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let prev_ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+    let new_ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+    let node = AsyncClusterNode::new(async { user_conn }.boxed().shared(), None, Some(prev_ip));
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().returned_ip_type =
+            ConnectionIPReturnType::Specified(new_ip);
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "1.1.1.1:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            Some(node),
+        )
+        .await;
+        assert!(node.is_ok());
+        let node = node.unwrap();
+        assert!(node.management_connection.is_some());
+        // Confirm that the user connection was changed
+        assert_ne!(node.user_connection.await.id, user_conn_id);
+        assert!(node.ip.is_some());
+        assert_eq!(node.ip.unwrap().to_string(), *"0.0.0.0");
+        assert_ne!(node.ip.unwrap(), prev_ip);
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_only_management_connection_err() {
+    // Test that when we try the refresh only the management connection and it fails, the user connection remains unaffected
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::OnlyManagementConnection;
+    let user_conn_id: usize = 1000;
+    let user_conn = MockConnection {
+        id: user_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let prev_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    let node = AsyncClusterNode::new(async { user_conn }.boxed().shared(), None, prev_ip);
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().return_connection_err = ShouldReturnConnectionError::Yes;
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            Some(node),
+        )
+        .await;
+        assert!(node.is_ok());
+        let node = node.unwrap();
+        // Confirm that the new management connection failed
+        assert!(node.management_connection.is_none());
+        // Confirm that the user connection remains unchanged
+        assert_eq!(node.user_connection.await.id, user_conn_id);
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_only_user_connection_same_ip() {
+    // Test that upon refreshing only the user connection, if the newly created connection share the same IP as the existing management connection,
+    // the managament connection remains unchanged
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::OnlyUserConnection;
+    let old_user_conn_id: usize = 1000;
+    let management_conn_id: usize = 2000;
+    let old_user_conn = MockConnection {
+        id: old_user_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let management_conn = MockConnection {
+        id: management_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let prev_ip = IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+    let node = AsyncClusterNode::new(
+        async { old_user_conn }.boxed().shared(),
+        Some(async { management_conn }.boxed().shared()),
+        Some(prev_ip),
+    );
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().returned_ip_type =
+            ConnectionIPReturnType::Specified(prev_ip);
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            Some(node),
+        )
+        .await;
+        assert!(node.is_ok());
+        let node = node.unwrap();
+        // Confirm that a new user connection was created
+        assert_ne!(node.user_connection.await.id, old_user_conn_id);
+        // Confirm that the management connection remains unchanged
+        assert_eq!(
+            node.management_connection.unwrap().await.id,
+            management_conn_id
+        );
+        reset_mock_connection();
+    })
+}
+
+#[test]
+fn test_connect_and_check_only_user_connection_new_ip_refreshing_both_connections() {
+    // Test that upon refreshing only the user connection, if the newly created connection has a different IP from the existing one,
+    // the managament connection is being refreshed too
+    let name = "0.0.0.0";
+
+    let MockEnv {
+        runtime,
+        async_connection: _connection,
+        handler: _handler,
+        ..
+    } = MockEnv::new(name, move |cmd: &[u8], _port| {
+        respond_startup(name, cmd)?;
+        Ok(())
+    });
+
+    let conn_type = RefreshConnectionType::OnlyUserConnection;
+    let old_user_conn_id: usize = 1000;
+    let management_conn_id: usize = 2000;
+    let old_user_conn = MockConnection {
+        id: old_user_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let management_conn = MockConnection {
+        id: management_conn_id,
+        handler: MOCK_CONN_UTILS
+            .read()
+            .unwrap()
+            .handler_map
+            .get(name)
+            .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
+            .clone(),
+        port: 6379,
+    };
+    let prev_ip = Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    let node = AsyncClusterNode::new(
+        async { old_user_conn }.boxed().shared(),
+        Some(async { management_conn }.boxed().shared()),
+        prev_ip,
+    );
+    runtime.block_on(async {
+        MOCK_CONN_UTILS.write().unwrap().returned_ip_type =
+            ConnectionIPReturnType::Different(AtomicUsize::new(0));
+        let node: RedisResult<AsyncClusterNode<MockConnection>> = connect_and_check(
+            "0.0.0.0:6379",
+            ClusterParams::default(),
+            None,
+            conn_type,
+            Some(node),
+        )
+        .await;
+        assert!(node.is_ok());
+        let node = node.unwrap();
+        // Confirm that a new user connection was created
+        assert_ne!(node.user_connection.await.id, old_user_conn_id);
+        // Confirm that a new management connection was created
+        assert_ne!(
+            node.management_connection.unwrap().await.id,
+            management_conn_id
+        );
+        reset_mock_connection();
+    })
 }
 
 #[test]
