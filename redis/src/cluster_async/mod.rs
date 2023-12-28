@@ -192,7 +192,8 @@ where
 }
 
 type ConnectionFuture<C> = future::Shared<BoxFuture<'static, C>>;
-type AsyncClusterNode<C> = ClusterNode<ConnectionFuture<C>>;
+#[doc(hidden)]
+pub type AsyncClusterNode<C> = ClusterNode<ConnectionFuture<C>>;
 type ConnectionMap<C> = connections_container::ConnectionsMap<ConnectionFuture<C>>;
 type ConnectionsContainer<C> =
     self::connections_container::ConnectionsContainer<ConnectionFuture<C>>;
@@ -501,8 +502,9 @@ enum ConnectionCheck<C> {
     Nothing,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum RefreshConnectionType {
+pub enum RefreshConnectionType {
     // Refresh only user connections
     OnlyUserConnection,
     // Refresh only management connections
@@ -1853,7 +1855,8 @@ where
     }
 }
 
-async fn connect_and_check<C>(
+#[doc(hidden)]
+pub async fn connect_and_check<C>(
     addr: &str,
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,

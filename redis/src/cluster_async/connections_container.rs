@@ -10,7 +10,8 @@ use crate::cluster_topology::{ReadFromReplicaStrategy, SlotMap, SlotMapValue, To
 type IdentifierType = ArcStr;
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) struct ClusterNode<Connection> {
+#[doc(hidden)]
+pub struct ClusterNode<Connection> {
     pub user_connection: Connection,
     pub management_connection: Option<Connection>,
     pub ip: Option<IpAddr>,
@@ -20,7 +21,7 @@ impl<Connection> ClusterNode<Connection>
 where
     Connection: Clone,
 {
-    pub(crate) fn new(
+    pub fn new(
         user_connection: Connection,
         management_connection: Option<Connection>,
         ip: Option<IpAddr>,

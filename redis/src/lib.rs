@@ -455,6 +455,10 @@ pub mod cluster_routing;
 #[cfg_attr(docsrs, doc(cfg(feature = "cluster")))]
 pub mod cluster_topology;
 
+/// For testing purposes
+#[cfg(feature = "cluster")]
+pub use crate::cluster_client::ClusterParams;
+
 #[cfg(feature = "r2d2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "r2d2")))]
 mod r2d2;
