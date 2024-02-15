@@ -486,6 +486,8 @@ mod tls;
 #[cfg(feature = "tls-rustls")]
 pub use crate::tls::{ClientTlsConfig, TlsCertificates};
 
+include!(concat!(env!("OUT_DIR"), "/const_gen.rs"));
+
 mod client;
 mod cmd;
 mod commands;

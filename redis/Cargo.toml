@@ -151,6 +151,11 @@ once_cell = "1"
 anyhow = "1"
 sscanf = "0.4.1"
 
+[build-dependencies]
+# This is required to set the client library version with a date if no version is provided
+chrono = "0.4"
+const-gen = "1.6.4"
+
 [[test]]
 name = "test_async"
 required-features = ["tokio-comp"]

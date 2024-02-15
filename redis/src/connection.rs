@@ -977,7 +977,7 @@ pub(crate) fn client_set_info_pipeline() -> Pipeline {
         .cmd("CLIENT")
         .arg("SETINFO")
         .arg("LIB-VER")
-        .arg(std::env!("GLIDE_VERSION"))
+        .arg(crate::GLIDE_VERSION)
         .ignore();
     pipeline
 }
