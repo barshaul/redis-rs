@@ -48,6 +48,7 @@ async fn connect_tcp(addr: &SocketAddr) -> io::Result<TcpStreamTokio> {
         let std_socket = socket.into_std()?;
         let socket2: socket2::Socket = std_socket.into();
         socket2.set_tcp_keepalive(&KEEP_ALIVE)?;
+        let _ = socket2.set_tcp_user_timeout(Some(std::time::Duration::from_secs(5)))?;
         TcpStreamTokio::from_std(socket2.into())
     }
 
