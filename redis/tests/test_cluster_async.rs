@@ -1080,11 +1080,14 @@ mod cluster_async {
             } else {
                 num_of_nodes * 2
             };
-            assert_eq!(
-                refresh_calls.load(atomic::Ordering::Relaxed),
-                expected_calls
-            );
-        });
+            for _ in 0..4 {
+                if refresh_calls.load(atomic::Ordering::Relaxed) == expected_calls {
+                    return Ok::<_, RedisError>(());
+                }
+                let _ = sleep(Duration::from_millis(50).into()).await;
+            }
+            panic!("Refresh slots wasn't called as expected!\nExpected CLUSTER SLOTS calls: {}, actual calls: {:?}", expected_calls, refresh_calls.load(atomic::Ordering::Relaxed));
+        }).unwrap()
     }
 
     fn test_async_cluster_refresh_topology_in_client_init_get_succeed(

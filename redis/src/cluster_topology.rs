@@ -6,13 +6,15 @@ use crate::cluster_client::SlotsRefreshRateLimit;
 use crate::cluster_routing::Slot;
 use crate::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap};
 use crate::{cluster::TlsMode, ErrorKind, RedisError, RedisResult, Value};
+#[cfg(all(feature = "cluster-async", not(feature = "tokio-comp")))]
+use async_std::sync::RwLock;
 use derivative::Derivative;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-#[cfg(feature = "cluster-async")]
+#[cfg(all(feature = "cluster-async", feature = "tokio-comp"))]
 use tokio::sync::RwLock;
 
 // Exponential backoff constants for retrying a slot refresh
