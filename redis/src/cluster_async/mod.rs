@@ -38,6 +38,7 @@ use std::{
         Arc, Mutex,
     },
     task::{self, Poll},
+    time::SystemTime,
 };
 
 use crate::{
@@ -60,8 +61,8 @@ use crate::{
         SlotAddr,
     },
     cluster_topology::{
-        calculate_topology, get_slot, DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES,
-        DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL, DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT,
+        calculate_topology, get_slot, SlotRefreshState, DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES,
+        DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL, DEFAULT_REFRESH_SLOTS_RETRY_MAX_INTERVAL,
     },
     connection::{PubSubSubscriptionInfo, PubSubSubscriptionKind},
     push_manager::PushInfo,
@@ -311,7 +312,7 @@ pub(crate) struct InnerCore<C> {
     pub(crate) conn_lock: RwLock<ConnectionsContainer<C>>,
     cluster_params: ClusterParams,
     pending_requests: Mutex<Vec<PendingRequest<C>>>,
-    slot_refresh_in_progress: AtomicBool,
+    slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     subscriptions_by_address: RwLock<HashMap<ArcStr, PubSubSubscriptionInfo>>,
@@ -406,6 +407,12 @@ impl<C> Dispose for ClusterConnInner<C> {
 pub(crate) enum InternalRoutingInfo<C> {
     SingleNode(InternalSingleNodeRouting<C>),
     MultiNode((MultipleNodeRoutingInfo, Option<ResponsePolicy>)),
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum ClientState {
+    Initializing,
+    Running,
 }
 
 impl<C> From<cluster_routing::RoutingInfo> for InternalRoutingInfo<C> {
@@ -878,6 +885,7 @@ where
                 .await?;
 
         let topology_checks_interval = cluster_params.topology_checks_interval;
+        let slots_refresh_rate_limiter = cluster_params.slots_refresh_rate_limit;
         let inner = Arc::new(InnerCore {
             conn_lock: RwLock::new(ConnectionsContainer::new(
                 Default::default(),
@@ -887,7 +895,7 @@ where
             )),
             cluster_params: cluster_params.clone(),
             pending_requests: Mutex::new(Vec::new()),
-            slot_refresh_in_progress: AtomicBool::new(false),
+            slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
             push_sender: push_sender.clone(),
             unassigned_subscriptions: RwLock::new(
@@ -907,7 +915,11 @@ where
             state: ConnectionState::PollComplete,
             shutdown_flag: shutdown_flag.clone(),
         };
-        Self::refresh_slots_and_subscriptions_with_retries(connection.inner.clone()).await?;
+        Self::refresh_slots_and_subscriptions_with_retries(
+            connection.inner.clone(),
+            &ClientState::Initializing,
+        )
+        .await?;
 
         if let Some(duration) = topology_checks_interval {
             let periodic_task = ClusterConnInner::periodic_topology_check(
@@ -1050,8 +1062,11 @@ where
                 0,
             );
             drop(write_lock);
-            if let Err(err) =
-                Self::refresh_slots_and_subscriptions_with_retries(inner.clone()).await
+            if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
+                inner.clone(),
+                &ClientState::Running,
+            )
+            .await
             {
                 warn!("Can't refresh slots with initial nodes: `{err}`");
             };
@@ -1215,30 +1230,54 @@ where
     // Query a node to discover slot-> master mappings with retries
     async fn refresh_slots_and_subscriptions_with_retries(
         inner: Arc<InnerCore<C>>,
+        client_state: &ClientState,
     ) -> RedisResult<()> {
-        if inner
-            .slot_refresh_in_progress
+        let SlotRefreshState {
+            in_progress,
+            last_run,
+            rate_limiter,
+        } = &inner.slot_refresh_state;
+        // Ensure only a single slot refresh operation occurs at a time
+        if in_progress
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
             return Ok(());
         }
+        if *client_state != ClientState::Initializing {
+            // Check if the current slot refresh is triggered before the wait duration has passed
+            let last_run_rlock = last_run.read().await;
+            if let Some(last_run_time) = *last_run_rlock {
+                let passed_time = SystemTime::now()
+                    .duration_since(last_run_time)
+                    .unwrap_or_else(|err| {
+                        warn!(
+                            "Failed to get the duration since the last slot refresh, received error: {:?}",
+                            err
+                        );
+                        // Setting the passed time to 0 will force the current refresh to continue and reset the stored last_run timestamp with the current one
+                        Duration::from_secs(0)
+                    });
+                if passed_time <= rate_limiter.wait_duration() {
+                    // Skip refreshing the slots since the wait duration (interval + jitter) has not passed
+                    return Ok(());
+                }
+            }
+        }
         let retry_strategy = ExponentialBackoff {
             initial_interval: DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL,
-            max_interval: DEFAULT_REFRESH_SLOTS_RETRY_TIMEOUT,
+            max_interval: DEFAULT_REFRESH_SLOTS_RETRY_MAX_INTERVAL,
             max_elapsed_time: None,
             ..Default::default()
         };
         let retries_counter = AtomicUsize::new(0);
         let res = retry(retry_strategy, || {
             let curr_retry = retries_counter.fetch_add(1, atomic::Ordering::Relaxed);
-            Self::refresh_slots(inner.clone(), curr_retry)
+            Self::refresh_slots(inner.clone(), curr_retry, client_state)
         })
         .await;
-        inner
-            .slot_refresh_in_progress
-            .store(false, Ordering::Relaxed);
 
+        in_progress.store(false, Ordering::Relaxed);
         Self::refresh_pubsub_subscriptions(inner).await;
 
         res
@@ -1247,7 +1286,11 @@ where
     pub(crate) async fn check_topology_and_refresh_if_diff(inner: Arc<InnerCore<C>>) -> bool {
         let topology_changed = Self::check_for_topology_diff(inner.clone()).await;
         if topology_changed {
-            let _ = Self::refresh_slots_and_subscriptions_with_retries(inner.clone()).await;
+            let _ = Self::refresh_slots_and_subscriptions_with_retries(
+                inner.clone(),
+                &ClientState::Running,
+            )
+            .await;
         }
         topology_changed
     }
@@ -1404,7 +1447,15 @@ where
     async fn refresh_slots(
         inner: Arc<InnerCore<C>>,
         curr_retry: usize,
+        client_state: &ClientState,
     ) -> Result<(), BackoffError<RedisError>> {
+        if *client_state != ClientState::Initializing {
+            // Set the slot refresh last_run timestamp to `now`
+            let now = SystemTime::now();
+            let mut last_run_wlock = inner.slot_refresh_state.last_run.write().await;
+            *last_run_wlock = Some(now);
+            drop(last_run_wlock);
+        }
         Self::refresh_slots_inner(inner, curr_retry)
             .await
             .map_err(|err| {
@@ -1817,6 +1868,7 @@ where
                     trace!("Recover slots failed!");
                     *future = Box::pin(Self::refresh_slots_and_subscriptions_with_retries(
                         self.inner.clone(),
+                        &ClientState::Running,
                     ));
                     Poll::Ready(Err(err))
                 }
@@ -2065,6 +2117,7 @@ where
                     self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
                         ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
                             self.inner.clone(),
+                            &ClientState::Running,
                         ),
                     )));
                 }

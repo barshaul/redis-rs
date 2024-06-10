@@ -18,6 +18,7 @@ mod cluster_async {
     use futures::prelude::*;
     use futures_time::task::sleep;
     use once_cell::sync::Lazy;
+    use std::ops::Add;
 
     use redis::{
         aio::{ConnectionLike, MultiplexedConnection},
@@ -897,45 +898,51 @@ mod cluster_async {
             runtime,
             async_connection: mut connection,
             ..
-        } = MockEnv::new(name, move |cmd: &[u8], port| {
-            if !started.load(atomic::Ordering::SeqCst) {
-                respond_startup_with_replica_using_config(
-                    name,
-                    cmd,
-                    Some(slots_config_vec[0].clone()),
-                )?;
-            }
-            started.store(true, atomic::Ordering::SeqCst);
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .slots_refresh_rate_limit(Duration::from_secs(0), 0),
+            name,
+            move |cmd: &[u8], port| {
+                if !started.load(atomic::Ordering::SeqCst) {
+                    respond_startup_with_replica_using_config(
+                        name,
+                        cmd,
+                        Some(slots_config_vec[0].clone()),
+                    )?;
+                }
+                started.store(true, atomic::Ordering::SeqCst);
 
-            if contains_slice(cmd, b"PING") {
-                return Err(Ok(Value::SimpleString("OK".into())));
-            }
+                if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
+                    return Err(Ok(Value::SimpleString("OK".into())));
+                }
 
-            let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
-            let is_get_cmd = contains_slice(cmd, b"GET");
-            let get_response = Err(Ok(Value::BulkString(b"123".to_vec())));
-            let moved_node = ports[0];
-            match i {
-                // Respond that the key exists on a node that does not yet have a connection:
-                0 => Err(parse_redis_value(
-                    format!("-MOVED 123 {name}:{moved_node}\r\n").as_bytes(),
-                )),
-                _ => {
-                    if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
-                        refresh_calls_cloned.fetch_add(1, atomic::Ordering::SeqCst);
-                        let view_index = get_node_view_index(slots_config_vec.len(), &ports, port);
-                        Err(Ok(create_topology_from_config(
-                            name,
-                            slots_config_vec[view_index].clone(),
-                        )))
-                    } else {
-                        assert_eq!(port, moved_node);
-                        assert!(is_get_cmd, "{:?}", std::str::from_utf8(cmd));
-                        get_response
+                let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
+                let is_get_cmd = contains_slice(cmd, b"GET");
+                let get_response = Err(Ok(Value::BulkString(b"123".to_vec())));
+                let moved_node = ports[0];
+                match i {
+                    // Respond that the key exists on a node that does not yet have a connection:
+                    0 => Err(parse_redis_value(
+                        format!("-MOVED 123 {name}:{moved_node}\r\n").as_bytes(),
+                    )),
+                    _ => {
+                        if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                            refresh_calls_cloned.fetch_add(1, atomic::Ordering::SeqCst);
+                            let view_index =
+                                get_node_view_index(slots_config_vec.len(), &ports, port);
+                            Err(Ok(create_topology_from_config(
+                                name,
+                                slots_config_vec[view_index].clone(),
+                            )))
+                        } else {
+                            assert_eq!(port, moved_node);
+                            assert!(is_get_cmd, "{:?}", std::str::from_utf8(cmd));
+                            get_response
+                        }
                     }
                 }
-            }
-        });
+            },
+        );
         runtime.block_on(async move {
         let res = cmd("GET")
             .arg("test")
@@ -962,6 +969,122 @@ mod cluster_async {
         }
         panic!("Failed to reach to the expected topology refresh retries. Found={refreshed_calls}, Expected={expected_calls}")
     });
+    }
+
+    fn test_async_cluster_refresh_slots_rate_limiter_helper(
+        slots_config_vec: Vec<Vec<MockSlotRange>>,
+        ports: Vec<u16>,
+        should_skip: bool,
+    ) {
+        assert!(!ports.is_empty() && !slots_config_vec.is_empty());
+
+        let test_name = format!(
+            "test_async_cluster_refresh_slots_rate_limiter_helper_{}",
+            if should_skip {
+                "should_skip"
+            } else {
+                "not_skipping_waiting_time_passed"
+            }
+        );
+
+        let requests = atomic::AtomicUsize::new(0);
+        let started = atomic::AtomicBool::new(false);
+        let refresh_calls = Arc::new(atomic::AtomicUsize::new(0));
+        let refresh_calls_cloned = Arc::clone(&refresh_calls);
+        let wait_duration = Duration::from_millis(10);
+        let num_of_nodes = ports.len();
+
+        let MockEnv {
+            runtime,
+            async_connection: mut connection,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{test_name}")])
+                .slots_refresh_rate_limit(wait_duration, 0),
+            test_name.clone().as_str(),
+            move |cmd: &[u8], port| {
+                if !started.load(atomic::Ordering::SeqCst) {
+                    respond_startup_with_replica_using_config(
+                        test_name.as_str(),
+                        cmd,
+                        Some(slots_config_vec[0].clone()),
+                    )?;
+                    started.store(true, atomic::Ordering::SeqCst);
+                }
+
+                if contains_slice(cmd, b"PING") {
+                    return Err(Ok(Value::SimpleString("OK".into())));
+                }
+
+                let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
+                let is_get_cmd = contains_slice(cmd, b"GET");
+                let get_response = Err(Ok(Value::BulkString(b"123".to_vec())));
+                let moved_node = ports[0];
+                let first_get_first_call_idx: usize = 0;
+                // The second GET request should be made after the first GET, which involves two requests (one with MOVED and the other with the actual GET),
+                // plus `num_of_nodes` additional calls to CLUSTER SLOTS during slot refresh.
+                let second_get_first_request_idx = num_of_nodes + 2;
+                match i {
+                    // The first request calls are the starting calls for each GET command where we want to respond with MOVED error
+                    idx if idx == first_get_first_call_idx
+                        || idx == second_get_first_request_idx =>
+                    {
+                        Err(parse_redis_value(
+                            format!("-MOVED 123 {test_name}:{moved_node}\r\n").as_bytes(),
+                        ))
+                    }
+                    _ => {
+                        if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                            refresh_calls_cloned.fetch_add(1, atomic::Ordering::SeqCst);
+                            let view_index =
+                                get_node_view_index(slots_config_vec.len(), &ports, port);
+                            Err(Ok(create_topology_from_config(
+                                test_name.as_str(),
+                                slots_config_vec[view_index].clone(),
+                            )))
+                        } else {
+                            // Even if the slots weren't refreshed we still expect the command to be
+                            // routed by the redirect host and port it received in the moved error
+                            assert_eq!(port, moved_node);
+                            assert!(is_get_cmd, "{:?}", std::str::from_utf8(cmd));
+                            get_response
+                        }
+                    }
+                }
+            },
+        );
+
+        runtime.block_on(async move {
+            // First GET request should raise MOVED error and then refresh slots
+            let res = cmd("GET")
+                .arg("test")
+                .query_async::<_, Option<i32>>(&mut connection)
+                .await;
+            assert_eq!(res, Ok(Some(123)));
+
+            if !should_skip {
+                // Wait for the wait duration to pass
+                let _ = sleep(wait_duration.add(Duration::from_millis(10)).into()).await;
+            }
+
+            // Second GET request to trigger another slot refresh due to MOVED error if should skip is false, otherwise slot refresh should be skipped
+            let res = cmd("GET")
+                .arg("test")
+                .query_async::<_, Option<i32>>(&mut connection)
+                .await;
+            assert_eq!(res, Ok(Some(123)));
+
+            // We should skip refreshing the slots on the second MOVED due to the rate limiter, so we should call CLUSTER SLOTS only once per node
+            let expected_calls = if should_skip {
+                num_of_nodes
+            } else {
+                num_of_nodes * 2
+            };
+            assert_eq!(
+                refresh_calls.load(atomic::Ordering::Relaxed),
+                expected_calls
+            );
+        });
     }
 
     fn test_async_cluster_refresh_topology_in_client_init_get_succeed(
