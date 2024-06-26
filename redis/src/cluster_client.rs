@@ -6,6 +6,7 @@ use crate::cluster_topology::{
 use crate::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
 use crate::types::{ErrorKind, ProtocolVersion, RedisError, RedisResult};
 use crate::{cluster, cluster::TlsMode};
+use crate::{PubSubSubscriptionInfo, PushInfo};
 use rand::Rng;
 #[cfg(feature = "cluster-async")]
 use std::ops::Add;

@@ -410,7 +410,7 @@ pub(crate) enum InternalRoutingInfo<C> {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-enum ClientState {
+pub(crate) enum ClientState {
     Initializing,
     Running,
 }
