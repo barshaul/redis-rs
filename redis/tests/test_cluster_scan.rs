@@ -381,6 +381,7 @@ mod test_cluster_scan_async {
             replicas: 1,
             ..Default::default()
         });
+
         let mut connection = cluster.async_connection(None).await;
 
         let mut expected_keys: Vec<String> = Vec::new();
