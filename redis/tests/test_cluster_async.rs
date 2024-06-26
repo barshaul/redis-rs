@@ -1398,6 +1398,22 @@ mod cluster_async {
         assert_eq!(
             connection_count_clone.load(Ordering::Relaxed),
             expected_init_calls + 1
+    fn test_async_cluster_refresh_slots_rate_limiter_skips_refresh() {
+        let ports = get_ports(3);
+        test_async_cluster_refresh_slots_rate_limiter_helper(
+            get_topology_with_majority(&ports),
+            ports,
+            true,
+        );
+    }
+
+    #[test]
+    fn test_async_cluster_refresh_slots_rate_limiter_does_refresh_when_wait_duration_passed() {
+        let ports = get_ports(3);
+        test_async_cluster_refresh_slots_rate_limiter_helper(
+            get_topology_with_majority(&ports),
+            ports,
+            false,
         );
     }
 
