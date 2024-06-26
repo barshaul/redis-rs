@@ -770,7 +770,7 @@ mod test_cluster_scan_async {
     // Testing cluster scan when connection fails in the middle and we get an error
     // then cluster up again and scanning can continue without any problem
     async fn test_async_cluster_scan_failover() {
-        let mut cluster = TestClusterContext::new(3, 0);
+        let mut cluster = TestClusterContext::new();
         let mut connection = cluster.async_connection(None).await;
         let mut i = 0;
         loop {
@@ -811,7 +811,7 @@ mod test_cluster_scan_async {
                 break;
             };
         }
-        cluster = TestClusterContext::new(3, 0);
+        cluster = TestClusterContext::new();
         connection = cluster.async_connection(None).await;
         loop {
             let scan_response: RedisResult<(ScanStateRC, Vec<Value>)> = connection
