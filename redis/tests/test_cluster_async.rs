@@ -1393,6 +1393,10 @@ mod cluster_async {
         assert_eq!(
             connection_count_clone.load(Ordering::Relaxed),
             expected_init_calls + 1
+        );
+    }
+
+    #[test]
     fn test_async_cluster_refresh_slots_rate_limiter_skips_refresh() {
         let ports = get_ports(3);
         test_async_cluster_refresh_slots_rate_limiter_helper(
@@ -2680,49 +2684,6 @@ mod cluster_async {
     }
 
     #[test]
-    fn test_async_cluster_reconnect_after_complete_server_disconnect() {
-        let cluster = TestClusterContext::new_with_cluster_client_builder(
-            3,
-            0,
-            |builder| {
-                builder.retries(2)
-                // Disable the rate limiter to refresh slots immediately
-                .slots_refresh_rate_limit(Duration::from_secs(0), 0)
-            },
-            false,
-        );
-
-        block_on_all(async move {
-            let mut connection = cluster.async_connection(None).await;
-            drop(cluster);
-            let cmd = cmd("PING");
-
-            let result = connection
-                .route_command(&cmd, RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
-                .await;
-            // TODO - this should be a NoConnectionError, but ATM we get the errors from the failing
-            assert!(result.is_err());
-
-            // This will route to all nodes - different path through the code.
-            let result = connection.req_packed_command(&cmd).await;
-            // TODO - this should be a NoConnectionError, but ATM we get the errors from the failing
-            assert!(result.is_err());
-
-            let _cluster = TestClusterContext::new_with_cluster_client_builder(
-                3,
-                0,
-                |builder| builder.retries(2),
-                false,
-            );
-
-            let result = connection.req_packed_command(&cmd).await.unwrap();
-            assert_eq!(result, Value::SimpleString("PONG".to_string()));
-            Ok::<_, RedisError>(())
-        })
-        .unwrap();
-    }
-
-    #[test]
     fn test_async_cluster_restore_resp3_pubsub_state_after_complete_server_disconnect() {
         // let cluster = TestClusterContext::new_with_cluster_client_builder(
         //     3,
@@ -3718,13 +3679,17 @@ mod cluster_async {
         let cluster = TestClusterContext::new_with_cluster_client_builder(
             3,
             0,
-            |builder| builder.retries(2),
+            |builder| {
+                builder.retries(2)
+                // Disable the rate limiter to refresh slots immediately
+                .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+            },
             false,
         );
+
         block_on_all(async move {
             let mut connection = cluster.async_connection(None).await;
             drop(cluster);
-
             let cmd = cmd("PING");
 
             let result = connection
@@ -3747,7 +3712,6 @@ mod cluster_async {
 
             let result = connection.req_packed_command(&cmd).await.unwrap();
             assert_eq!(result, Value::SimpleString("PONG".to_string()));
-
             Ok::<_, RedisError>(())
         })
         .unwrap();
