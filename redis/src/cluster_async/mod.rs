@@ -1258,6 +1258,10 @@ where
         inner: Arc<InnerCore<C>>,
         trigger: &RefreshTrigger,
     ) -> RedisResult<()> {
+        debug!(
+            "Refresh slots and subscriptions was called by trigger {:?}",
+            trigger
+        );
         let SlotRefreshState {
             in_progress,
             last_run,
@@ -1270,7 +1274,7 @@ where
         {
             return Ok(());
         }
-
+        let mut skip_slots_refresh = false;
         if trigger.is_throttable() {
             // Check if the current slot refresh is triggered before the wait duration has passed
             let last_run_rlock = last_run.read().await;
@@ -1287,27 +1291,30 @@ where
                     });
                 let wait_duration = rate_limiter.wait_duration();
                 if passed_time <= wait_duration {
-                    debug!("Skipping slot refreshment as the wait duration hasn't yet passed. Passed time = {:?}, 
+                    debug!("Skipping slot refresh as the wait duration hasn't yet passed. Passed time = {:?}, 
                             Wait duration = {:?}", passed_time, wait_duration);
-                    // Skip refreshing the slots since the wait duration (interval + jitter) has not passed
-                    return Ok(());
+                    skip_slots_refresh = true;
                 }
             }
         }
-        let retry_strategy = ExponentialBackoff {
-            initial_interval: DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL,
-            max_interval: DEFAULT_REFRESH_SLOTS_RETRY_MAX_INTERVAL,
-            max_elapsed_time: None,
-            ..Default::default()
-        };
-        let retries_counter = AtomicUsize::new(0);
-        let res = retry(retry_strategy, || {
-            let curr_retry = retries_counter.fetch_add(1, atomic::Ordering::Relaxed);
-            Self::refresh_slots(inner.clone(), curr_retry)
-        })
-        .await;
 
+        let mut res = Ok(());
+        if !skip_slots_refresh {
+            let retry_strategy = ExponentialBackoff {
+                initial_interval: DEFAULT_REFRESH_SLOTS_RETRY_INITIAL_INTERVAL,
+                max_interval: DEFAULT_REFRESH_SLOTS_RETRY_MAX_INTERVAL,
+                max_elapsed_time: None,
+                ..Default::default()
+            };
+            let retries_counter = AtomicUsize::new(0);
+            res = retry(retry_strategy, || {
+                let curr_retry = retries_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                Self::refresh_slots(inner.clone(), curr_retry)
+            })
+            .await;
+        }
         in_progress.store(false, Ordering::Relaxed);
+
         Self::refresh_pubsub_subscriptions(inner).await;
 
         res
