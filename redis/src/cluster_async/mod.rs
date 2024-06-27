@@ -409,10 +409,36 @@ pub(crate) enum InternalRoutingInfo<C> {
     MultiNode((MultipleNodeRoutingInfo, Option<ResponsePolicy>)),
 }
 
+/// Represents the different triggers for refreshing the cluster slots.
 #[derive(PartialEq, Clone, Debug)]
-pub(crate) enum ClientState {
+pub(crate) enum RefreshTrigger {
+    /// Triggered when the client is initializing.
     Initializing,
-    Running,
+
+    /// Triggered when an error is encountered.
+    /// This is often used to handle errors such as MOVED responses,
+    /// indicating that the slot distribution has changed.
+    ErrorEncountered,
+
+    /// Triggered by periodic checks.
+    PeriodicCheck,
+
+    /// Triggered by a cluster SCAN command.
+    ScanCmd,
+}
+
+impl RefreshTrigger {
+    /// Determines if slot refresh called by this trigger should be subject to throttling by the rate limiter.
+    fn is_throttable(&self) -> bool {
+        match self {
+            RefreshTrigger::ErrorEncountered => true,
+            RefreshTrigger::PeriodicCheck => true,
+            RefreshTrigger::Initializing => false,
+            // The cluster SCAN implementation must refresh the slots when a topology change is found
+            // to ensure the scan logic is correct.
+            RefreshTrigger::ScanCmd => false,
+        }
+    }
 }
 
 impl<C> From<cluster_routing::RoutingInfo> for InternalRoutingInfo<C> {
@@ -917,7 +943,7 @@ where
         };
         Self::refresh_slots_and_subscriptions_with_retries(
             connection.inner.clone(),
-            &ClientState::Initializing,
+            &RefreshTrigger::Initializing,
         )
         .await?;
 
@@ -1064,7 +1090,7 @@ where
             drop(write_lock);
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
-                &ClientState::Running,
+                &RefreshTrigger::ErrorEncountered,
             )
             .await
             {
@@ -1230,7 +1256,7 @@ where
     // Query a node to discover slot-> master mappings with retries
     async fn refresh_slots_and_subscriptions_with_retries(
         inner: Arc<InnerCore<C>>,
-        client_state: &ClientState,
+        trigger: &RefreshTrigger,
     ) -> RedisResult<()> {
         let SlotRefreshState {
             in_progress,
@@ -1244,7 +1270,8 @@ where
         {
             return Ok(());
         }
-        if *client_state != ClientState::Initializing {
+
+        if trigger.is_throttable() {
             // Check if the current slot refresh is triggered before the wait duration has passed
             let last_run_rlock = last_run.read().await;
             if let Some(last_run_time) = *last_run_rlock {
@@ -1273,7 +1300,7 @@ where
         let retries_counter = AtomicUsize::new(0);
         let res = retry(retry_strategy, || {
             let curr_retry = retries_counter.fetch_add(1, atomic::Ordering::Relaxed);
-            Self::refresh_slots(inner.clone(), curr_retry, client_state)
+            Self::refresh_slots(inner.clone(), curr_retry)
         })
         .await;
 
@@ -1283,14 +1310,14 @@ where
         res
     }
 
-    pub(crate) async fn check_topology_and_refresh_if_diff(inner: Arc<InnerCore<C>>) -> bool {
+    pub(crate) async fn check_topology_and_refresh_if_diff(
+        inner: Arc<InnerCore<C>>,
+        trigger: &RefreshTrigger,
+    ) -> bool {
         let topology_changed = Self::check_for_topology_diff(inner.clone()).await;
         if topology_changed {
-            let _ = Self::refresh_slots_and_subscriptions_with_retries(
-                inner.clone(),
-                &ClientState::Running,
-            )
-            .await;
+            let _ =
+                Self::refresh_slots_and_subscriptions_with_retries(inner.clone(), trigger).await;
         }
         topology_changed
     }
@@ -1305,7 +1332,11 @@ where
                 return;
             }
             let _ = boxed_sleep(interval_duration).await;
-            let topology_changed = Self::check_topology_and_refresh_if_diff(inner.clone()).await;
+            let topology_changed = Self::check_topology_and_refresh_if_diff(
+                inner.clone(),
+                &RefreshTrigger::PeriodicCheck,
+            )
+            .await;
             if !topology_changed {
                 // This serves as a safety measure for validating pubsub subsctiptions state in case it has drifted
                 // while topology stayed the same.
@@ -1447,15 +1478,12 @@ where
     async fn refresh_slots(
         inner: Arc<InnerCore<C>>,
         curr_retry: usize,
-        client_state: &ClientState,
     ) -> Result<(), BackoffError<RedisError>> {
-        if *client_state != ClientState::Initializing {
-            // Set the slot refresh last_run timestamp to `now`
-            let now = SystemTime::now();
-            let mut last_run_wlock = inner.slot_refresh_state.last_run.write().await;
-            *last_run_wlock = Some(now);
-            drop(last_run_wlock);
-        }
+        // Update the slot refresh last run timestamp
+        let now = SystemTime::now();
+        let mut last_run_wlock = inner.slot_refresh_state.last_run.write().await;
+        *last_run_wlock = Some(now);
+        drop(last_run_wlock);
         Self::refresh_slots_inner(inner, curr_retry)
             .await
             .map_err(|err| {
@@ -1868,7 +1896,7 @@ where
                     trace!("Recover slots failed!");
                     *future = Box::pin(Self::refresh_slots_and_subscriptions_with_retries(
                         self.inner.clone(),
-                        &ClientState::Running,
+                        &RefreshTrigger::ErrorEncountered,
                     ));
                     Poll::Ready(Err(err))
                 }
@@ -2117,7 +2145,7 @@ where
                     self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
                         ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
                             self.inner.clone(),
-                            &ClientState::Running,
+                            &RefreshTrigger::ErrorEncountered,
                         ),
                     )));
                 }

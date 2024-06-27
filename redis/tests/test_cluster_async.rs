@@ -900,6 +900,7 @@ mod cluster_async {
             ..
         } = MockEnv::with_client_builder(
             ClusterClient::builder(vec![&*format!("redis://{name}")])
+                // Disable the rate limiter to refresh slots immediately on all MOVED errors.
                 .slots_refresh_rate_limit(Duration::from_secs(0), 0),
             name,
             move |cmd: &[u8], port| {
@@ -976,8 +977,16 @@ mod cluster_async {
         ports: Vec<u16>,
         should_skip: bool,
     ) {
-        assert!(!ports.is_empty() && !slots_config_vec.is_empty());
+        // This test queries GET, which returns a MOVED error. If `should_skip` is true,
+        // it indicates that we should skip refreshing slots because the specified time
+        // duration since the last refresh slots call has not yet passed. In this case,
+        // we expect CLUSTER SLOTS not to be called on the nodes after receiving the
+        // MOVED error.
 
+        // If `should_skip` is false, we verify that if the MOVED error occurs after the
+        // time duration of the rate limiter has passed, the refresh slots operation
+        // should not be skipped. We assert this by expecting calls to CLUSTER SLOTS on
+        // all nodes.
         let test_name = format!(
             "test_async_cluster_refresh_slots_rate_limiter_helper_{}",
             if should_skip {
@@ -1020,15 +1029,13 @@ mod cluster_async {
                 let is_get_cmd = contains_slice(cmd, b"GET");
                 let get_response = Err(Ok(Value::BulkString(b"123".to_vec())));
                 let moved_node = ports[0];
-                let first_get_first_call_idx: usize = 0;
-                // The second GET request should be made after the first GET, which involves two requests (one with MOVED and the other with the actual GET),
-                // plus `num_of_nodes` additional calls to CLUSTER SLOTS during slot refresh.
-                let second_get_first_request_idx = num_of_nodes + 2;
                 match i {
                     // The first request calls are the starting calls for each GET command where we want to respond with MOVED error
-                    idx if idx == first_get_first_call_idx
-                        || idx == second_get_first_request_idx =>
-                    {
+                    0 => {
+                        if !should_skip {
+                            // Wait for the wait duration to pass
+                            std::thread::sleep(wait_duration.add(Duration::from_millis(10)));
+                        }
                         Err(parse_redis_value(
                             format!("-MOVED 123 {test_name}:{moved_node}\r\n").as_bytes(),
                         ))
@@ -1062,23 +1069,11 @@ mod cluster_async {
                 .await;
             assert_eq!(res, Ok(Some(123)));
 
-            if !should_skip {
-                // Wait for the wait duration to pass
-                let _ = sleep(wait_duration.add(Duration::from_millis(10)).into()).await;
-            }
-
-            // Second GET request to trigger another slot refresh due to MOVED error if should skip is false, otherwise slot refresh should be skipped
-            let res = cmd("GET")
-                .arg("test")
-                .query_async::<_, Option<i32>>(&mut connection)
-                .await;
-            assert_eq!(res, Ok(Some(123)));
-
-            // We should skip refreshing the slots on the second MOVED due to the rate limiter, so we should call CLUSTER SLOTS only once per node
+            // We should skip is false, we should call CLUSTER SLOTS once per node
             let expected_calls = if should_skip {
-                num_of_nodes
+                0
             } else {
-                num_of_nodes * 2
+                num_of_nodes
             };
             for _ in 0..4 {
                 if refresh_calls.load(atomic::Ordering::Relaxed) == expected_calls {
@@ -2685,6 +2680,49 @@ mod cluster_async {
     }
 
     #[test]
+    fn test_async_cluster_reconnect_after_complete_server_disconnect() {
+        let cluster = TestClusterContext::new_with_cluster_client_builder(
+            3,
+            0,
+            |builder| {
+                builder.retries(2)
+                // Disable the rate limiter to refresh slots immediately
+                .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+            },
+            false,
+        );
+
+        block_on_all(async move {
+            let mut connection = cluster.async_connection(None).await;
+            drop(cluster);
+            let cmd = cmd("PING");
+
+            let result = connection
+                .route_command(&cmd, RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
+                .await;
+            // TODO - this should be a NoConnectionError, but ATM we get the errors from the failing
+            assert!(result.is_err());
+
+            // This will route to all nodes - different path through the code.
+            let result = connection.req_packed_command(&cmd).await;
+            // TODO - this should be a NoConnectionError, but ATM we get the errors from the failing
+            assert!(result.is_err());
+
+            let _cluster = TestClusterContext::new_with_cluster_client_builder(
+                3,
+                0,
+                |builder| builder.retries(2),
+                false,
+            );
+
+            let result = connection.req_packed_command(&cmd).await.unwrap();
+            assert_eq!(result, Value::SimpleString("PONG".to_string()));
+            Ok::<_, RedisError>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn test_async_cluster_restore_resp3_pubsub_state_after_complete_server_disconnect() {
         // let cluster = TestClusterContext::new_with_cluster_client_builder(
         //     3,
@@ -3379,7 +3417,12 @@ mod cluster_async {
         let cluster = TestClusterContext::new_with_cluster_client_builder(
             6,
             1,
-            |builder| builder.periodic_topology_checks(Duration::from_millis(10)),
+            |builder| {
+                builder
+                    .periodic_topology_checks(Duration::from_millis(10))
+                    // Disable the rate limiter to refresh slots immediately on all MOVED errors
+                    .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+            },
             false,
         );
 
@@ -3441,7 +3484,11 @@ mod cluster_async {
         let cluster = TestClusterContext::new_with_cluster_client_builder(
             3,
             0,
-            |builder| builder.periodic_topology_checks(Duration::from_millis(10)),
+            |builder| {
+                builder.periodic_topology_checks(Duration::from_millis(10))
+                            // Disable the rate limiter to refresh slots immediately
+                            .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+            },
             false,
         );
 
@@ -3818,7 +3865,11 @@ mod cluster_async {
         let cluster = TestClusterContext::new_with_cluster_client_builder(
             3,
             0,
-            |builder| builder.periodic_topology_checks(Duration::from_millis(10)),
+            |builder| {
+                builder.periodic_topology_checks(Duration::from_millis(10))
+                // Disable the rate limiter to refresh slots immediately on the periodic checks
+                .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+            },
             false,
         );
 
