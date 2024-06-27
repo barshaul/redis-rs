@@ -1239,7 +1239,9 @@ mod cluster_async {
             handler: _handler,
             ..
         } = MockEnv::with_client_builder(
-            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(0),
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(0)                
+            // Disable the rate limiter to refresh slots immediately on the MOVED error.
+            .slots_refresh_rate_limit(Duration::from_secs(0), 0),
             name,
             move |cmd: &[u8], port| {
                 if !should_refresh.load(atomic::Ordering::SeqCst) {

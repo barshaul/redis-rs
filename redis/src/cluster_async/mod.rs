@@ -94,7 +94,7 @@ use tokio::sync::{
     oneshot::{self, Receiver},
     RwLock,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use self::{
     connections_container::{ConnectionAndAddress, ConnectionType, ConnectionsMap},
@@ -1285,7 +1285,10 @@ where
                         // Setting the passed time to 0 will force the current refresh to continue and reset the stored last_run timestamp with the current one
                         Duration::from_secs(0)
                     });
-                if passed_time <= rate_limiter.wait_duration() {
+                let wait_duration = rate_limiter.wait_duration();
+                if passed_time <= wait_duration {
+                    debug!("Skipping slot refreshment as the wait duration hasn't yet passed. Passed time = {:?}, 
+                            Wait duration = {:?}", passed_time, wait_duration);
                     // Skip refreshing the slots since the wait duration (interval + jitter) has not passed
                     return Ok(());
                 }
