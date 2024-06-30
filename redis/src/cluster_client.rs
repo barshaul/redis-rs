@@ -116,7 +116,7 @@ impl Default for SlotsRefreshRateLimit {
 impl SlotsRefreshRateLimit {
     pub(crate) fn wait_duration(&self) -> Duration {
         let duration_jitter = match self.max_jitter_milli {
-            0 => Duration::from_secs(0),
+            0 => Duration::from_millis(0),
             _ => Duration::from_millis(rand::thread_rng().gen_range(0..self.max_jitter_milli)),
         };
         self.interval_duration.add(duration_jitter)

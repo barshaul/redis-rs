@@ -1,7 +1,7 @@
 use crate::aio::ConnectionLike;
 use crate::cluster_async::{
-    ClusterConnInner, Connect, Core, InternalRoutingInfo, InternalSingleNodeRouting,
-    RefreshTrigger, Response,
+    ClusterConnInner, Connect, Core, InternalRoutingInfo, InternalSingleNodeRouting, RefreshPolicy,
+    Response,
 };
 use crate::cluster_routing::SlotAddr;
 use crate::cluster_topology::SLOT_SIZE;
@@ -388,7 +388,9 @@ where
     async fn refresh_if_topology_changed(&self) {
         ClusterConnInner::check_topology_and_refresh_if_diff(
             self.to_owned(),
-            &RefreshTrigger::ScanCmd,
+            // The cluster SCAN implementation must refresh the slots when a topology change is found
+            // to ensure the scan logic is correct.
+            &RefreshPolicy::NotThrottable,
         )
         .await;
     }

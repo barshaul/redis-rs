@@ -409,36 +409,15 @@ pub(crate) enum InternalRoutingInfo<C> {
     MultiNode((MultipleNodeRoutingInfo, Option<ResponsePolicy>)),
 }
 
-/// Represents the different triggers for refreshing the cluster slots.
 #[derive(PartialEq, Clone, Debug)]
-pub(crate) enum RefreshTrigger {
-    /// Triggered when the client is initializing.
-    Initializing,
-
-    /// Triggered when an error is encountered.
-    /// This is often used to handle errors such as MOVED responses,
-    /// indicating that the slot distribution has changed.
-    ErrorEncountered,
-
-    /// Triggered by periodic checks.
-    PeriodicCheck,
-
-    /// Triggered by a cluster SCAN command.
-    ScanCmd,
-}
-
-impl RefreshTrigger {
-    /// Determines if slot refresh called by this trigger should be subject to throttling by the rate limiter.
-    fn is_throttable(&self) -> bool {
-        match self {
-            RefreshTrigger::ErrorEncountered => true,
-            RefreshTrigger::PeriodicCheck => true,
-            RefreshTrigger::Initializing => false,
-            // The cluster SCAN implementation must refresh the slots when a topology change is found
-            // to ensure the scan logic is correct.
-            RefreshTrigger::ScanCmd => false,
-        }
-    }
+/// Represents different policies for refreshing the cluster slots.
+pub(crate) enum RefreshPolicy {
+    /// `Throttable` indicates that the refresh operation can be throttled,
+    /// meaning it can be delayed or rate-limited if necessary.
+    Throttable,
+    /// `NotThrottable` indicates that the refresh operation should not be throttled,
+    /// meaning it should be executed immediately without any delay or rate-limiting.
+    NotThrottable,
 }
 
 impl<C> From<cluster_routing::RoutingInfo> for InternalRoutingInfo<C> {
@@ -943,7 +922,7 @@ where
         };
         Self::refresh_slots_and_subscriptions_with_retries(
             connection.inner.clone(),
-            &RefreshTrigger::Initializing,
+            &RefreshPolicy::NotThrottable,
         )
         .await?;
 
@@ -1090,7 +1069,7 @@ where
             drop(write_lock);
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
-                &RefreshTrigger::ErrorEncountered,
+                &RefreshPolicy::Throttable,
             )
             .await
             {
@@ -1256,12 +1235,8 @@ where
     // Query a node to discover slot-> master mappings with retries
     async fn refresh_slots_and_subscriptions_with_retries(
         inner: Arc<InnerCore<C>>,
-        trigger: &RefreshTrigger,
+        policy: &RefreshPolicy,
     ) -> RedisResult<()> {
-        debug!(
-            "Refresh slots and subscriptions was called by trigger {:?}",
-            trigger
-        );
         let SlotRefreshState {
             in_progress,
             last_run,
@@ -1275,7 +1250,7 @@ where
             return Ok(());
         }
         let mut skip_slots_refresh = false;
-        if trigger.is_throttable() {
+        if *policy == RefreshPolicy::Throttable {
             // Check if the current slot refresh is triggered before the wait duration has passed
             let last_run_rlock = last_run.read().await;
             if let Some(last_run_time) = *last_run_rlock {
@@ -1322,12 +1297,11 @@ where
 
     pub(crate) async fn check_topology_and_refresh_if_diff(
         inner: Arc<InnerCore<C>>,
-        trigger: &RefreshTrigger,
+        policy: &RefreshPolicy,
     ) -> bool {
         let topology_changed = Self::check_for_topology_diff(inner.clone()).await;
         if topology_changed {
-            let _ =
-                Self::refresh_slots_and_subscriptions_with_retries(inner.clone(), trigger).await;
+            let _ = Self::refresh_slots_and_subscriptions_with_retries(inner.clone(), policy).await;
         }
         topology_changed
     }
@@ -1342,11 +1316,9 @@ where
                 return;
             }
             let _ = boxed_sleep(interval_duration).await;
-            let topology_changed = Self::check_topology_and_refresh_if_diff(
-                inner.clone(),
-                &RefreshTrigger::PeriodicCheck,
-            )
-            .await;
+            let topology_changed =
+                Self::check_topology_and_refresh_if_diff(inner.clone(), &RefreshPolicy::Throttable)
+                    .await;
             if !topology_changed {
                 // This serves as a safety measure for validating pubsub subsctiptions state in case it has drifted
                 // while topology stayed the same.
@@ -1906,7 +1878,7 @@ where
                     trace!("Recover slots failed!");
                     *future = Box::pin(Self::refresh_slots_and_subscriptions_with_retries(
                         self.inner.clone(),
-                        &RefreshTrigger::ErrorEncountered,
+                        &RefreshPolicy::Throttable,
                     ));
                     Poll::Ready(Err(err))
                 }
@@ -2155,7 +2127,7 @@ where
                     self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
                         ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
                             self.inner.clone(),
-                            &RefreshTrigger::ErrorEncountered,
+                            &RefreshPolicy::Throttable,
                         ),
                     )));
                 }
