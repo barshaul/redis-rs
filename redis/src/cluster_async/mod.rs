@@ -1447,12 +1447,14 @@ where
         }
         drop(read_guard);
 
-        Self::refresh_connections(
-            inner,
-            failed_connections,
-            RefreshConnectionType::OnlyManagementConnection,
-        )
-        .await;
+        if !failed_connections.is_empty() {
+            Self::refresh_connections(
+                inner,
+                failed_connections,
+                RefreshConnectionType::OnlyManagementConnection,
+            )
+            .await;
+        }
 
         false
     }
