@@ -1861,7 +1861,7 @@ where
                         // - For non-key-based commands, avoid attempting redirection to a random node
                         //   as it wouldn't result in MOVED hints and can lead to unwanted results
                         //   (e.g., sending management command to a different node than the user asked for); instead, raise the error.
-                        let routable_cmd = cmd.map(|cmd| Routable::command(&*cmd)).flatten();
+                        let routable_cmd = cmd.and_then(|cmd| Routable::command(&*cmd));
                         if routable_cmd.is_some()
                             && !RoutingInfo::is_key_based_cmd(&routable_cmd.unwrap())
                         {

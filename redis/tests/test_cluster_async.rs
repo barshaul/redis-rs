@@ -4041,13 +4041,13 @@ mod cluster_async {
                     MockSlotRange {
                         primary_port: 6379,
                         replica_ports: vec![],
-                        slot_range: (0 as u16..8000 as u16),
+                        slot_range: (0_u16..8000_u16),
                     },
                     MockSlotRange {
                         primary_port: 6380,
                         replica_ports: vec![],
                         // Don't cover all slots
-                        slot_range: (8001 as u16..12000 as u16),
+                        slot_range: (8001_u16..12000_u16),
                     },
                 ];
                 respond_startup_with_config(name, received_cmd, Some(slots_config_vec), false)?;
@@ -4057,7 +4057,7 @@ mod cluster_async {
             },
         );
 
-        let _ = runtime
+        runtime
             .block_on(async move {
                 let uncovered_slot = 16000;
                 let route = redis::cluster_routing::Route::new(
@@ -4105,13 +4105,13 @@ mod cluster_async {
                     MockSlotRange {
                         primary_port: 6379,
                         replica_ports: vec![],
-                        slot_range: (0 as u16..8000 as u16),
+                        slot_range: (0_u16..8000_u16),
                     },
                     MockSlotRange {
                         primary_port: 6380,
                         replica_ports: vec![],
                         // Don't cover all slots
-                        slot_range: (8001 as u16..12000 as u16),
+                        slot_range: (8001_u16..12000_u16),
                     },
                 ];
                 respond_startup_with_config(name, received_cmd, Some(slots_config_vec), false)?;
@@ -4128,7 +4128,7 @@ mod cluster_async {
             },
         );
 
-        let _ = runtime
+        runtime
             .block_on(async move {
                 // The keyslot of "foo" is 12182 and it isn't covered by any node, so we expect the
                 // request to be routed to a random node and then to be redirected to the MOVED node (2 requests in total)
