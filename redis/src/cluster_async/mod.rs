@@ -39,6 +39,7 @@ use crate::{
 };
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use async_std::task::{spawn, JoinHandle};
+use dashmap::DashMap;
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use futures::executor::block_on;
 use std::{
@@ -1090,10 +1091,10 @@ where
             .buffer_unordered(initial_nodes.len())
             .fold(
                 (
-                    ConnectionsMap(HashMap::with_capacity(initial_nodes.len())),
+                    ConnectionsMap(DashMap::with_capacity(initial_nodes.len())),
                     None,
                 ),
-                |mut connections: (ConnectionMap<C>, Option<String>), addr_conn_res| async move {
+                |connections: (ConnectionMap<C>, Option<String>), addr_conn_res| async move {
                     match addr_conn_res {
                         Ok((addr, node)) => {
                             connections.0 .0.insert(addr.into(), node);
@@ -1156,14 +1157,14 @@ where
         conn_type: RefreshConnectionType,
     ) {
         info!("Started refreshing connections to {:?}", addresses);
-        let mut connections_container = inner.conn_lock.write().await;
+        let connections_container = inner.conn_lock.read().await;
         let cluster_params = &inner.cluster_params;
         let subscriptions_by_address = &inner.subscriptions_by_address;
         let push_sender = &inner.push_sender;
 
         stream::iter(addresses.into_iter())
             .fold(
-                &mut *connections_container,
+                &*connections_container,
                 |connections_container, address| async move {
                     let node_option = connections_container.remove_node(&address);
 
@@ -1476,12 +1477,12 @@ where
         drop(subs_by_address_guard);
 
         if !addrs_to_refresh.is_empty() {
-            let mut conns_write_guard = inner.conn_lock.write().await;
+            let conns_read_guard = inner.conn_lock.read().await;
             // have to remove or otherwise the refresh_connection wont trigger node recreation
             for addr_to_refresh in addrs_to_refresh.iter() {
-                conns_write_guard.remove_node(addr_to_refresh);
+                conns_read_guard.remove_node(addr_to_refresh);
             }
-            drop(conns_write_guard);
+            drop(conns_read_guard);
             // immediately trigger connection reestablishment
             Self::refresh_connections(
                 inner.clone(),
@@ -1609,8 +1610,8 @@ where
             .await;
         let new_connections: ConnectionMap<C> = stream::iter(addresses_and_connections_iter)
             .fold(
-                ConnectionsMap(HashMap::with_capacity(nodes_len)),
-                |mut connections, (addr, node)| async {
+                ConnectionsMap(DashMap::with_capacity(nodes_len)),
+                |connections, (addr, node)| async {
                     let mut cluster_params = inner.cluster_params.clone();
                     let subs_guard = inner.subscriptions_by_address.read().await;
                     cluster_params.pubsub_subscriptions =
@@ -1923,7 +1924,7 @@ where
                 {
                     Ok(node) => {
                         let connection_clone = node.user_connection.conn.clone().await;
-                        let mut connections = core.conn_lock.write().await;
+                        let connections = core.conn_lock.read().await;
                         let address = connections.replace_or_add_connection_for_address(addr, node);
                         drop(connections);
                         (address, connection_clone)
@@ -1993,7 +1994,7 @@ where
         if !is_primary {
             // If the connection is a replica, remove the connection and retry.
             // The connection will be established again on the next call to refresh slots once the replica is no longer in loading state.
-            core.conn_lock.write().await.remove_node(&address);
+            core.conn_lock.read().await.remove_node(&address);
         } else {
             // If the connection is primary, just sleep and retry
             let sleep_duration = core.cluster_params.retry_params.wait_time_for_retry(retry);
