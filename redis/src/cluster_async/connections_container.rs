@@ -2,7 +2,6 @@ use crate::cluster_async::ConnectionFuture;
 use crate::cluster_routing::{Route, SlotAddr};
 use crate::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap, SlotMapValue};
 use crate::cluster_topology::TopologyHash;
-use arcstr::ArcStr;
 use dashmap::DashMap;
 use futures::FutureExt;
 use rand::seq::IteratorRandom;
@@ -85,7 +84,7 @@ pub(crate) enum ConnectionType {
     PreferManagement,
 }
 
-pub(crate) struct ConnectionsMap<Connection>(pub(crate) DashMap<ArcStr, ClusterNode<Connection>>);
+pub(crate) struct ConnectionsMap<Connection>(pub(crate) DashMap<String, ClusterNode<Connection>>);
 
 impl<Connection> std::fmt::Display for ConnectionsMap<Connection> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,7 +100,7 @@ impl<Connection> std::fmt::Display for ConnectionsMap<Connection> {
 }
 
 pub(crate) struct ConnectionsContainer<Connection> {
-    connection_map: DashMap<ArcStr, ClusterNode<Connection>>,
+    connection_map: DashMap<String, ClusterNode<Connection>>,
     pub(crate) slot_map: SlotMap,
     read_from_replica_strategy: ReadFromReplicaStrategy,
     topology_hash: TopologyHash,
@@ -118,7 +117,7 @@ impl<Connection> Default for ConnectionsContainer<Connection> {
     }
 }
 
-pub(crate) type ConnectionAndAddress<Connection> = (ArcStr, Connection);
+pub(crate) type ConnectionAndAddress<Connection> = (String, Connection);
 
 impl<Connection> ConnectionsContainer<Connection>
 where
@@ -139,7 +138,7 @@ where
     }
 
     /// Returns true if the address represents a known primary node.
-    pub(crate) fn is_primary(&self, address: &ArcStr) -> bool {
+    pub(crate) fn is_primary(&self, address: &String) -> bool {
         self.connection_for_address(address).is_some()
             && self
                 .slot_map
@@ -262,15 +261,15 @@ where
 
     pub(crate) fn replace_or_add_connection_for_address(
         &self,
-        address: impl Into<ArcStr>,
+        address: impl Into<String>,
         node: ClusterNode<Connection>,
-    ) -> ArcStr {
+    ) -> String {
         let address = address.into();
         self.connection_map.insert(address.clone(), node);
         address
     }
 
-    pub(crate) fn remove_node(&self, address: &ArcStr) -> Option<ClusterNode<Connection>> {
+    pub(crate) fn remove_node(&self, address: &String) -> Option<ClusterNode<Connection>> {
         self.connection_map
             .remove(address)
             .map(|(_key, value)| value)

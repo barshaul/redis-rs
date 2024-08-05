@@ -82,7 +82,6 @@ use std::time::Duration;
 
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use crate::aio::{async_std::AsyncStd, RedisRuntime};
-use arcstr::ArcStr;
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
 use backoff_std_async::future::retry;
 #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
@@ -382,7 +381,7 @@ pub(crate) struct InnerCore<C> {
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
     push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    subscriptions_by_address: RwLock<HashMap<ArcStr, PubSubSubscriptionInfo>>,
+    subscriptions_by_address: RwLock<HashMap<String, PubSubSubscriptionInfo>>,
     unassigned_subscriptions: RwLock<PubSubSubscriptionInfo>,
 }
 
@@ -517,7 +516,7 @@ pub(crate) enum InternalSingleNodeRouting<C> {
     SpecificNode(Route),
     ByAddress(String),
     Connection {
-        address: ArcStr,
+        address: String,
         conn: ConnectionFuture<C>,
     },
     Redirect {
@@ -614,14 +613,14 @@ pub(crate) enum Response {
 }
 
 pub(crate) enum OperationTarget {
-    Node { address: ArcStr },
+    Node { address: String },
     FanOut,
     NotFound,
 }
 type OperationResult = Result<Response, (OperationTarget, RedisError)>;
 
-impl From<ArcStr> for OperationTarget {
-    fn from(address: ArcStr) -> Self {
+impl From<String> for OperationTarget {
+    fn from(address: String) -> Self {
         OperationTarget::Node { address }
     }
 }
@@ -762,12 +761,12 @@ enum Next<C> {
     },
     RetryBusyLoadingError {
         request: PendingRequest<C>,
-        address: ArcStr,
+        address: String,
     },
     Reconnect {
         // if not set, then a reconnect should happen without sending a request afterwards
         request: Option<PendingRequest<C>>,
-        target: ArcStr,
+        target: String,
     },
     RefreshSlots {
         // if not set, then a slot refresh should happen without sending a request afterwards
@@ -944,7 +943,7 @@ impl<C> Request<C> {
 }
 
 enum ConnectionCheck<C> {
-    Found((ArcStr, ConnectionFuture<C>)),
+    Found((String, ConnectionFuture<C>)),
     OnlyAddress(String),
     RandomConnection,
 }
@@ -1097,7 +1096,7 @@ where
                 |connections: (ConnectionMap<C>, Option<String>), addr_conn_res| async move {
                     match addr_conn_res {
                         Ok((addr, node)) => {
-                            connections.0 .0.insert(addr.into(), node);
+                            connections.0 .0.insert(addr, node);
                             (connections.0, None)
                         }
                         Err(e) => (connections.0, Some(e.to_string())),
@@ -1153,7 +1152,7 @@ where
 
     async fn refresh_connections(
         inner: Arc<InnerCore<C>>,
-        addresses: Vec<ArcStr>,
+        addresses: Vec<String>,
         conn_type: RefreshConnectionType,
     ) {
         info!("Started refreshing connections to {:?}", addresses);
@@ -1201,7 +1200,7 @@ where
     }
 
     async fn aggregate_results(
-        receivers: Vec<(Option<ArcStr>, oneshot::Receiver<RedisResult<Response>>)>,
+        receivers: Vec<(Option<String>, oneshot::Receiver<RedisResult<Response>>)>,
         routing: &MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
     ) -> RedisResult<Value> {
@@ -1405,7 +1404,7 @@ where
             return;
         }
 
-        let mut addrs_to_refresh: HashSet<ArcStr> = HashSet::new();
+        let mut addrs_to_refresh: HashSet<String> = HashSet::new();
         let mut subs_by_address_guard = inner.subscriptions_by_address.write().await;
         let mut unassigned_subs_guard = inner.unassigned_subscriptions.write().await;
         let conns_read_guard = inner.conn_lock.read().await;
@@ -1614,8 +1613,7 @@ where
                 |connections, (addr, node)| async {
                     let mut cluster_params = inner.cluster_params.clone();
                     let subs_guard = inner.subscriptions_by_address.read().await;
-                    cluster_params.pubsub_subscriptions =
-                        subs_guard.get(&ArcStr::from(addr.as_str())).cloned();
+                    cluster_params.pubsub_subscriptions = subs_guard.get(addr).cloned();
                     drop(subs_guard);
                     let node = get_or_create_conn(
                         addr,
@@ -1674,7 +1672,7 @@ where
                 Item = Option<(Arc<Cmd>, ConnectionAndAddress<ConnectionFuture<C>>)>,
             >,
         ) -> (
-            Vec<(Option<ArcStr>, Receiver<Result<Response, RedisError>>)>,
+            Vec<(Option<String>, Receiver<Result<Response, RedisError>>)>,
             Vec<Option<PendingRequest<C>>>,
         ) {
             iterator
@@ -1786,7 +1784,7 @@ where
         pipeline: Arc<crate::Pipeline>,
         offset: usize,
         count: usize,
-        conn: impl Future<Output = RedisResult<(ArcStr, C)>>,
+        conn: impl Future<Output = RedisResult<(String, C)>>,
     ) -> OperationResult {
         trace!("try_pipeline_request");
         let (address, mut conn) = conn.await.map_err(|err| (OperationTarget::NotFound, err))?;
@@ -1834,7 +1832,7 @@ where
         routing: InternalSingleNodeRouting<C>,
         core: Core<C>,
         cmd: Option<Arc<Cmd>>,
-    ) -> RedisResult<(ArcStr, C)> {
+    ) -> RedisResult<(String, C)> {
         let read_guard = core.conn_lock.read().await;
         let mut asking = false;
 
@@ -1986,7 +1984,7 @@ where
     async fn handle_loading_error(
         core: Core<C>,
         info: RequestInfo<C>,
-        address: ArcStr,
+        address: String,
         retry: u32,
     ) -> OperationResult {
         let is_primary = core.conn_lock.read().await.is_primary(&address);
@@ -2138,7 +2136,7 @@ where
 enum PollFlushAction {
     None,
     RebuildSlots,
-    Reconnect(Vec<ArcStr>),
+    Reconnect(Vec<String>),
     ReconnectFromInitialConnections,
 }
 
@@ -2270,7 +2268,7 @@ async fn calculate_topology_from_random_nodes<'a, C>(
         crate::cluster_slotmap::SlotMap,
         crate::cluster_topology::TopologyHash,
     )>,
-    Vec<ArcStr>,
+    Vec<String>,
 )
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
