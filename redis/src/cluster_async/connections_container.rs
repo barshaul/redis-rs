@@ -309,8 +309,8 @@ mod tests {
             }
         }
     }
-    fn remove_nodes(container: &ConnectionsContainer<usize>, addresss: &[&str]) {
-        for address in addresss {
+    fn remove_nodes(container: &ConnectionsContainer<usize>, addresses: &[&str]) {
+        for address in addresses {
             container.remove_node(&(*address).into());
         }
     }
