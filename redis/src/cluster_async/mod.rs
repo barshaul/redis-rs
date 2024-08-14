@@ -1132,12 +1132,7 @@ where
                 }
             };
             let mut write_lock = inner.conn_lock.write().await;
-            *write_lock = ConnectionsContainer::new(
-                Default::default(),
-                connection_map,
-                inner.cluster_params.read_from_replicas,
-                0,
-            );
+            write_lock.extend_connection_map(connection_map);
             drop(write_lock);
             if let Err(err) = Self::refresh_slots_and_subscriptions_with_retries(
                 inner.clone(),
