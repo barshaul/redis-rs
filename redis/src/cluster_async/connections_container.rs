@@ -185,7 +185,6 @@ where
 
     fn lookup_route(&self, route: &Route) -> Option<ConnectionAndAddress<Connection>> {
         let slot_map_value = self.slot_map.slot_value_for_route(route)?;
-        println!("slot_map_value={slot_map_value:?}");
         let addrs = &slot_map_value.addrs;
         if addrs.replicas.is_empty() {
             return self.connection_for_address(addrs.primary.as_str());
@@ -279,7 +278,6 @@ where
     }
 
     pub(crate) fn remove_node(&self, address: &String) -> Option<ClusterNode<Connection>> {
-        println!("removing node {address}");
         self.connection_map
             .remove(address)
             .map(|(_key, value)| value)
