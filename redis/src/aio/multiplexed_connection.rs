@@ -1,5 +1,6 @@
 use super::{ConnectionLike, Runtime};
 use crate::aio::setup_connection;
+use crate::aio::DisconnectNotifier;
 use crate::cmd::Cmd;
 #[cfg(any(feature = "tokio-comp", feature = "async-std-comp"))]
 use crate::parser::ValueCodec;
@@ -23,6 +24,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{self, Poll};
 use std::time::Duration;
@@ -73,19 +75,11 @@ struct PipelineMessage<S> {
 /// items being output by the `Stream` (the number is specified at time of sending). With the
 /// interface provided by `Pipeline` an easy interface of request to response, hiding the `Stream`
 /// and `Sink`.
+#[derive(Clone)]
 struct Pipeline<SinkItem> {
     sender: mpsc::Sender<PipelineMessage<SinkItem>>,
-
     push_manager: Arc<ArcSwap<PushManager>>,
-}
-
-impl<SinkItem> Clone for Pipeline<SinkItem> {
-    fn clone(&self) -> Self {
-        Pipeline {
-            sender: self.sender.clone(),
-            push_manager: self.push_manager.clone(),
-        }
-    }
+    is_stream_closed: Arc<AtomicBool>,
 }
 
 impl<SinkItem> Debug for Pipeline<SinkItem>
@@ -104,6 +98,8 @@ pin_project! {
         in_flight: VecDeque<InFlight>,
         error: Option<RedisError>,
         push_manager: Arc<ArcSwap<PushManager>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        is_stream_closed: Arc<AtomicBool>,
     }
 }
 
@@ -111,7 +107,12 @@ impl<T> PipelineSink<T>
 where
     T: Stream<Item = RedisResult<Value>> + 'static,
 {
-    fn new<SinkItem>(sink_stream: T, push_manager: Arc<ArcSwap<PushManager>>) -> Self
+    fn new<SinkItem>(
+        sink_stream: T,
+        push_manager: Arc<ArcSwap<PushManager>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        is_stream_closed: Arc<AtomicBool>,
+    ) -> Self
     where
         T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
     {
@@ -120,6 +121,8 @@ where
             in_flight: VecDeque::new(),
             error: None,
             push_manager,
+            disconnect_notifier,
+            is_stream_closed,
         }
     }
 
@@ -130,7 +133,15 @@ where
                 Some(result) => result,
                 // The redis response stream is not going to produce any more items so we `Err`
                 // to break out of the `forward` combinator and stop handling requests
-                None => return Poll::Ready(Err(())),
+                None => {
+                    // this is the right place to notify about the passive TCP disconnect
+                    // In other places we cannot distinguish between the active destruction of MultiplexedConnection and passive disconnect
+                    if let Some(disconnect_notifier) = self.as_mut().project().disconnect_notifier {
+                        disconnect_notifier.notify_disconnect();
+                    }
+                    self.is_stream_closed.store(true, Ordering::Relaxed);
+                    return Poll::Ready(Err(()));
+                }
             };
             self.as_mut().send_result(item);
         }
@@ -296,7 +307,10 @@ impl<SinkItem> Pipeline<SinkItem>
 where
     SinkItem: Send + 'static,
 {
-    fn new<T>(sink_stream: T) -> (Self, impl Future<Output = ()>)
+    fn new<T>(
+        sink_stream: T,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    ) -> (Self, impl Future<Output = ()>)
     where
         T: Sink<SinkItem, Error = RedisError> + Stream<Item = RedisResult<Value>> + 'static,
         T: Send + 'static,
@@ -308,7 +322,13 @@ where
         let (sender, mut receiver) = mpsc::channel(BUFFER_SIZE);
         let push_manager: Arc<ArcSwap<PushManager>> =
             Arc::new(ArcSwap::new(Arc::new(PushManager::default())));
-        let sink = PipelineSink::new::<SinkItem>(sink_stream, push_manager.clone());
+        let is_stream_closed = Arc::new(AtomicBool::new(false));
+        let sink = PipelineSink::new::<SinkItem>(
+            sink_stream,
+            push_manager.clone(),
+            disconnect_notifier,
+            is_stream_closed.clone(),
+        );
         let f = stream::poll_fn(move |cx| receiver.poll_recv(cx))
             .map(Ok)
             .forward(sink)
@@ -317,6 +337,7 @@ where
             Pipeline {
                 sender,
                 push_manager,
+                is_stream_closed,
             },
             f,
         )
@@ -363,6 +384,10 @@ where
     async fn set_push_manager(&mut self, push_manager: PushManager) {
         self.push_manager.store(Arc::new(push_manager));
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.is_stream_closed.load(Ordering::Relaxed)
+    }
 }
 
 /// A connection object which can be cloned, allowing requests to be be sent concurrently
@@ -392,6 +417,7 @@ impl MultiplexedConnection {
         connection_info: &ConnectionInfo,
         stream: C,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
@@ -401,6 +427,7 @@ impl MultiplexedConnection {
             stream,
             std::time::Duration::MAX,
             push_sender,
+            disconnect_notifier,
         )
         .await
     }
@@ -412,6 +439,7 @@ impl MultiplexedConnection {
         stream: C,
         response_timeout: std::time::Duration,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(Self, impl Future<Output = ()>)>
     where
         C: Unpin + AsyncRead + AsyncWrite + Send + 'static,
@@ -429,7 +457,7 @@ impl MultiplexedConnection {
         let codec = ValueCodec::default()
             .framed(stream)
             .and_then(|msg| async move { msg });
-        let (mut pipeline, driver) = Pipeline::new(codec);
+        let (mut pipeline, driver) = Pipeline::new(codec, disconnect_notifier);
         let driver = boxed(driver);
         let pm = PushManager::default();
         if let Some(sender) = push_sender {
@@ -559,6 +587,10 @@ impl ConnectionLike for MultiplexedConnection {
 
     fn get_db(&self) -> i64 {
         self.db
+    }
+
+    fn is_closed(&self) -> bool {
+        self.pipeline.is_closed()
     }
 }
 impl MultiplexedConnection {

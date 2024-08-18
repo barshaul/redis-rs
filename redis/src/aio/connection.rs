@@ -305,6 +305,11 @@ where
     fn get_db(&self) -> i64 {
         self.db
     }
+
+    fn is_closed(&self) -> bool {
+        // always false for AsyncRead + AsyncWrite (cant do better)
+        false
+    }
 }
 
 /// Represents a `PubSub` connection.

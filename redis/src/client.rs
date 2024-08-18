@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+#[cfg(feature = "aio")]
+use crate::aio::DisconnectNotifier;
+
 use crate::{
     connection::{connect, Connection, ConnectionInfo, ConnectionLike, IntoConnectionInfo},
     push_manager::PushInfo,
@@ -147,11 +150,13 @@ impl Client {
     pub async fn get_multiplexed_async_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
             push_sender,
+            disconnect_notifier,
         )
         .await
     }
@@ -167,6 +172,7 @@ impl Client {
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let result = match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
@@ -177,6 +183,7 @@ impl Client {
                         response_timeout,
                         None,
                         push_sender,
+                        disconnect_notifier,
                     ),
                 )
                 .await
@@ -189,6 +196,7 @@ impl Client {
                         response_timeout,
                         None,
                         push_sender,
+                        disconnect_notifier,
                     ),
                 )
                 .await
@@ -213,6 +221,7 @@ impl Client {
     pub async fn get_multiplexed_async_connection_and_ip(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(crate::aio::MultiplexedConnection, Option<IpAddr>)> {
         match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
@@ -221,6 +230,7 @@ impl Client {
                     Duration::MAX,
                     None,
                     push_sender,
+                    disconnect_notifier,
                 )
                 .await
             }
@@ -230,6 +240,7 @@ impl Client {
                     Duration::MAX,
                     None,
                     push_sender,
+                    disconnect_notifier,
                 )
                 .await
             }
@@ -247,6 +258,7 @@ impl Client {
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let result = Runtime::locate()
             .timeout(
@@ -255,6 +267,7 @@ impl Client {
                     response_timeout,
                     None,
                     push_sender,
+                    disconnect_notifier,
                 ),
             )
             .await;
@@ -275,11 +288,13 @@ impl Client {
     pub async fn get_multiplexed_tokio_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         self.get_multiplexed_tokio_connection_with_response_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
             push_sender,
+            disconnect_notifier,
         )
         .await
     }
@@ -295,6 +310,7 @@ impl Client {
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let result = Runtime::locate()
             .timeout(
@@ -303,6 +319,7 @@ impl Client {
                     response_timeout,
                     None,
                     push_sender,
+                    disconnect_notifier,
                 ),
             )
             .await;
@@ -323,11 +340,13 @@ impl Client {
     pub async fn get_multiplexed_async_std_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         self.get_multiplexed_async_std_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
             push_sender,
+            disconnect_notifier,
         )
         .await
     }
@@ -344,6 +363,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -352,6 +372,7 @@ impl Client {
             response_timeout,
             None,
             push_sender,
+            disconnect_notifier,
         )
         .await
         .map(|(conn, driver, _ip)| (conn, driver))
@@ -367,6 +388,7 @@ impl Client {
     pub async fn create_multiplexed_tokio_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -374,6 +396,7 @@ impl Client {
         self.create_multiplexed_tokio_connection_with_response_timeout(
             std::time::Duration::MAX,
             push_sender,
+            disconnect_notifier,
         )
         .await
         .map(|conn_res| (conn_res.0, conn_res.1))
@@ -391,6 +414,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -399,6 +423,7 @@ impl Client {
             response_timeout,
             None,
             push_sender,
+            disconnect_notifier,
         )
         .await
         .map(|(conn, driver, _ip)| (conn, driver))
@@ -414,6 +439,7 @@ impl Client {
     pub async fn create_multiplexed_async_std_connection(
         &self,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -421,6 +447,7 @@ impl Client {
         self.create_multiplexed_async_std_connection_with_response_timeout(
             std::time::Duration::MAX,
             push_sender,
+            disconnect_notifier,
         )
         .await
     }
@@ -624,6 +651,7 @@ impl Client {
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(crate::aio::MultiplexedConnection, Option<IpAddr>)>
     where
         T: crate::aio::RedisRuntime,
@@ -633,6 +661,7 @@ impl Client {
                 response_timeout,
                 socket_addr,
                 push_sender,
+                disconnect_notifier,
             )
             .await?;
         T::spawn(driver);
@@ -644,6 +673,7 @@ impl Client {
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -658,6 +688,7 @@ impl Client {
             con,
             response_timeout,
             push_sender,
+            disconnect_notifier,
         )
         .await
         .map(|res| (res.0, res.1, ip))
