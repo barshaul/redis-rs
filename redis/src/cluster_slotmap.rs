@@ -109,7 +109,6 @@ impl SlotMap {
         slot_map
     }
 
-    #[allow(dead_code)] // used in tests
     pub(crate) fn nodes_map(&self) -> &NodesMap {
         &self.nodes_map
     }
