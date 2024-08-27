@@ -504,19 +504,18 @@ mod tests {
     }
 
     fn get_node_addr(name: &str, port: u16) -> ShardAddrs {
-        ShardAddrs {
-            primary: format!("{name}:{port}").into(),
-            replicas: Vec::new(),
-        }
+        ShardAddrs::new(format!("{name}:{port}").into(), Vec::new())
     }
 
     fn collect_shard_addrs(slot_map: &SlotMap) -> Vec<ShardAddrs> {
         let mut shard_addrs: Vec<ShardAddrs> = slot_map
-            .nodes_map
+            .nodes_map()
             .iter()
             .map(|map_item| {
                 let shard_addrs = map_item.value();
-                let addr_reader = shard_addrs.read().unwrap();
+                let addr_reader = shard_addrs
+                    .read()
+                    .expect("Failed to obtain ShardAddrs's read lock");
                 addr_reader.clone()
             })
             .collect();

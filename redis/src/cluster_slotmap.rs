@@ -16,7 +16,7 @@ pub(crate) type NodesMap = DashMap<Arc<String>, Arc<RwLock<ShardAddrs>>>;
 pub(crate) struct SlotMapValue {
     pub(crate) start: u16,
     pub(crate) addrs: Arc<RwLock<ShardAddrs>>,
-    pub(crate) latest_used_replica: AtomicUsize,
+    pub(crate) last_used_replica: AtomicUsize,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Copy)]
@@ -29,7 +29,7 @@ pub(crate) enum ReadFromReplicaStrategy {
 #[derive(Debug, Default)]
 pub(crate) struct SlotMap {
     pub(crate) slots: BTreeMap<u16, SlotMapValue>,
-    pub(crate) nodes_map: NodesMap,
+    nodes_map: NodesMap,
     read_from_replica: ReadFromReplicaStrategy,
 }
 
@@ -38,34 +38,39 @@ fn get_address_from_slot(
     read_from_replica: ReadFromReplicaStrategy,
     slot_addr: SlotAddr,
 ) -> Arc<String> {
-    let addrs = slot.addrs.read().unwrap();
-    if slot_addr == SlotAddr::Master || addrs.replicas.is_empty() {
-        return addrs.primary.clone();
+    let addrs = slot
+        .addrs
+        .read()
+        .expect("Failed to obtain ShardAddrs's read lock");
+    if slot_addr == SlotAddr::Master || addrs.replicas().is_empty() {
+        return addrs.primary();
     }
     match read_from_replica {
-        ReadFromReplicaStrategy::AlwaysFromPrimary => addrs.primary.clone(),
+        ReadFromReplicaStrategy::AlwaysFromPrimary => addrs.primary(),
         ReadFromReplicaStrategy::RoundRobin => {
             let index = slot
-                .latest_used_replica
+                .last_used_replica
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                % addrs.replicas.len();
-            addrs.replicas[index].clone()
+                % addrs.replicas().len();
+            addrs.replicas()[index].clone()
         }
     }
 }
 
 impl SlotMap {
-    pub(crate) fn new(slots: Vec<Slot>, read_from_replica: ReadFromReplicaStrategy) -> Self {
-        let mut slot_map = SlotMap {
+    pub(crate) fn new_with_read_strategy(read_from_replica: ReadFromReplicaStrategy) -> Self {
+        SlotMap {
             slots: BTreeMap::new(),
             nodes_map: DashMap::new(),
             read_from_replica,
-        };
+        }
+    }
+
+    pub(crate) fn new(slots: Vec<Slot>, read_from_replica: ReadFromReplicaStrategy) -> Self {
+        let mut slot_map = SlotMap::new_with_read_strategy(read_from_replica);
         let mut shard_id = 0;
         for slot in slots {
             let primary = Arc::new(slot.master);
-            let replicas: Vec<Arc<String>> = slot.replicas.into_iter().map(Arc::new).collect();
-
             // Get the shard addresses if the primary is already in nodes_map;
             // otherwise, create a new ShardAddrs and add it
             let shard_addrs_arc = slot_map
@@ -73,15 +78,17 @@ impl SlotMap {
                 .entry(primary.clone())
                 .or_insert_with(|| {
                     shard_id += 1;
-                    Arc::new(RwLock::new(ShardAddrs {
-                        primary,
-                        replicas: replicas.clone(),
-                    }))
+                    let replicas: Vec<Arc<String>> =
+                        slot.replicas.into_iter().map(Arc::new).collect();
+                    Arc::new(RwLock::new(ShardAddrs::new(primary, replicas)))
                 })
                 .clone();
 
+            let replicas_reader = shard_addrs_arc
+                .read()
+                .expect("Failed to obtain reader lock for ShardAddrs");
             // Add all replicas to nodes_map with a reference to the same ShardAddrs if not already present
-            replicas.iter().for_each(|replica| {
+            replicas_reader.replicas().iter().for_each(|replica| {
                 slot_map
                     .nodes_map
                     .entry(replica.clone())
@@ -94,7 +101,7 @@ impl SlotMap {
                 SlotMapValue {
                     addrs: shard_addrs_arc.clone(),
                     start: slot.start,
-                    latest_used_replica: AtomicUsize::new(0),
+                    last_used_replica: AtomicUsize::new(0),
                 },
             );
         }
@@ -102,9 +109,18 @@ impl SlotMap {
         slot_map
     }
 
+    #[allow(dead_code)] // used in tests
+    pub(crate) fn nodes_map(&self) -> &NodesMap {
+        &self.nodes_map
+    }
+
     pub fn is_primary(&self, address: &String) -> bool {
         self.nodes_map.get(address).map_or(false, |shard_addrs| {
-            *shard_addrs.read().unwrap().primary == *address
+            *shard_addrs
+                .read()
+                .expect("Failed to obtain ShardAddrs's read lock")
+                .primary()
+                == *address
         })
     }
 
@@ -133,7 +149,11 @@ impl SlotMap {
             .iter()
             .map(|map_item| {
                 let shard_addrs = map_item.value();
-                shard_addrs.read().unwrap().primary.clone()
+                shard_addrs
+                    .read()
+                    .expect("Failed to obtain ShardAddrs's read lock")
+                    .primary()
+                    .clone()
             })
             .collect()
     }
@@ -165,9 +185,12 @@ impl SlotMap {
         self.slots
             .iter()
             .filter_map(|(end, slot_value)| {
-                let addr_reader = slot_value.addrs.read().unwrap();
-                if addr_reader.primary == node_address
-                    || addr_reader.replicas.contains(&node_address)
+                let addr_reader = slot_value
+                    .addrs
+                    .read()
+                    .expect("Failed to obtain ShardAddrs's read lock");
+                if addr_reader.primary() == node_address
+                    || addr_reader.replicas().contains(&node_address)
                 {
                     Some(slot_value.start..(*end + 1))
                 } else {
@@ -201,13 +224,17 @@ impl Display for SlotMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Strategy: {:?}. Slot mapping:", self.read_from_replica)?;
         for (end, slot_map_value) in self.slots.iter() {
+            let shard_addrs = slot_map_value
+                .addrs
+                .read()
+                .expect("Failed to obtain ShardAddrs's read lock");
             writeln!(
                 f,
                 "({}-{}): primary: {}, replicas: {:?}",
                 slot_map_value.start,
                 end,
-                slot_map_value.addrs.read().unwrap().primary,
-                slot_map_value.addrs.read().unwrap().replicas
+                shard_addrs.primary(),
+                shard_addrs.replicas()
             )?;
         }
         Ok(())

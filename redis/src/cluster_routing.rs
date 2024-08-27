@@ -896,8 +896,22 @@ pub enum SlotAddr {
 /// a command is executed
 #[derive(Debug, Eq, PartialEq, Clone, PartialOrd, Ord)]
 pub(crate) struct ShardAddrs {
-    pub(crate) primary: Arc<String>,
-    pub(crate) replicas: Vec<Arc<String>>,
+    primary: Arc<String>,
+    replicas: Vec<Arc<String>>,
+}
+
+impl ShardAddrs {
+    pub(crate) fn new(primary: Arc<String>, replicas: Vec<Arc<String>>) -> Self {
+        Self { primary, replicas }
+    }
+
+    pub(crate) fn primary(&self) -> Arc<String> {
+        self.primary.clone()
+    }
+
+    pub(crate) fn replicas(&self) -> &Vec<Arc<String>> {
+        self.replicas.as_ref()
+    }
 }
 
 impl<'a> IntoIterator for &'a ShardAddrs {
