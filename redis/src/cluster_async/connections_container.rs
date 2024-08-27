@@ -147,18 +147,14 @@ where
 
     /// Returns true if the address represents a known primary node.
     pub(crate) fn is_primary(&self, address: &String) -> bool {
-        self.connection_for_address(address).is_some()
-            && self
-                .slot_map
-                .values()
-                .any(|slot_addrs| slot_addrs.primary.as_str() == address)
+        self.connection_for_address(address).is_some() && self.slot_map.is_primary(address)
     }
 
     fn round_robin_read_from_replica(
         &self,
         slot_map_value: &SlotMapValue,
     ) -> Option<ConnectionAndAddress<Connection>> {
-        let addrs = &slot_map_value.addrs;
+        let addrs = &slot_map_value.addrs.read().unwrap();
         let initial_index = slot_map_value
             .latest_used_replica
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -185,7 +181,7 @@ where
 
     fn lookup_route(&self, route: &Route) -> Option<ConnectionAndAddress<Connection>> {
         let slot_map_value = self.slot_map.slot_value_for_route(route)?;
-        let addrs = &slot_map_value.addrs;
+        let addrs = &slot_map_value.addrs.read().unwrap();
         if addrs.replicas.is_empty() {
             return self.connection_for_address(addrs.primary.as_str());
         }
@@ -232,7 +228,7 @@ where
         self.slot_map
             .addresses_for_all_primaries()
             .into_iter()
-            .flat_map(|addr| self.connection_for_address(addr))
+            .flat_map(|addr| self.connection_for_address(&addr))
     }
 
     pub(crate) fn node_for_address(&self, address: &str) -> Option<ClusterNode<Connection>> {
