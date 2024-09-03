@@ -239,7 +239,7 @@ pub mod async_tests {
     use redis::{
         aio::MultiplexedConnection,
         sentinel::{Sentinel, SentinelClient, SentinelNodeConnectionInfo},
-        Client, ConnectionAddr, RedisError,
+        Client, ConnectionAddr, GlideConnectionOptions, RedisError,
     };
 
     use crate::{assert_is_master_role, assert_replica_role_and_master_addr, support::*};
@@ -283,7 +283,7 @@ pub mod async_tests {
                 .await
                 .unwrap();
             let mut replica_con = replica_client
-                .get_multiplexed_async_connection(None, None)
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
                 .await
                 .unwrap();
 
@@ -316,7 +316,7 @@ pub mod async_tests {
                 .await
                 .unwrap();
             let mut replica_con = replica_client
-                .get_multiplexed_async_connection(None, None)
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
                 .await
                 .unwrap();
 
@@ -339,13 +339,13 @@ pub mod async_tests {
                 .async_master_for(master_name, Some(&node_conn_info))
                 .await?;
             let mut master_con = master_client
-                .get_multiplexed_async_connection(None, None)
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
                 .await?;
 
             let mut replica_con = sentinel
                 .async_replica_for(master_name, Some(&node_conn_info))
                 .await?
-                .get_multiplexed_async_connection(None, None)
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
                 .await?;
 
             async_assert_is_connection_to_master(&mut master_con).await;
@@ -370,7 +370,7 @@ pub mod async_tests {
                 .async_master_for(master_name, Some(&node_conn_info))
                 .await?;
             let mut master_con = master_client
-                .get_multiplexed_async_connection(None, None)
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
                 .await?;
 
             async_assert_is_connection_to_master(&mut master_con).await;
@@ -413,7 +413,7 @@ pub mod async_tests {
                 .async_master_for(master_name, Some(&node_conn_info))
                 .await?;
             let mut master_con = master_client
-                .get_multiplexed_async_connection(None, None)
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
                 .await?;
 
             async_assert_is_connection_to_master(&mut master_con).await;

@@ -21,6 +21,9 @@ use redis::{ClientTlsConfig, TlsCertificates};
 use socket2::{Domain, Socket, Type};
 use tempfile::TempDir;
 
+#[cfg(feature = "aio")]
+use redis::GlideConnectionOptions;
+
 pub fn use_protocol() -> ProtocolVersion {
     if env::var("PROTOCOL").unwrap_or_default() == "RESP3" {
         ProtocolVersion::RESP3
@@ -502,7 +505,7 @@ impl TestContext {
     #[cfg(feature = "aio")]
     pub async fn async_connection(&self) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
         self.client
-            .get_multiplexed_async_connection(None, None)
+            .get_multiplexed_async_connection(GlideConnectionOptions::default())
             .await
     }
 
@@ -516,7 +519,7 @@ impl TestContext {
         &self,
     ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
         self.client
-            .get_multiplexed_async_std_connection(None, None)
+            .get_multiplexed_async_std_connection(GlideConnectionOptions::default())
             .await
     }
 
@@ -536,7 +539,7 @@ impl TestContext {
         &self,
     ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
         self.client
-            .get_multiplexed_tokio_connection(None, None)
+            .get_multiplexed_tokio_connection(GlideConnectionOptions::default())
             .await
     }
 
@@ -545,7 +548,7 @@ impl TestContext {
         &self,
     ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
         self.client
-            .get_multiplexed_async_std_connection(None, None)
+            .get_multiplexed_async_std_connection(GlideConnectionOptions::default())
             .await
     }
 

@@ -6,15 +6,14 @@ use super::{
 };
 use crate::{
     aio::{ConnectionLike, DisconnectNotifier, Runtime},
+    client::GlideConnectionOptions,
     cluster::get_connection_info,
     cluster_client::ClusterParams,
-    push_manager::PushInfo,
     ErrorKind, RedisError, RedisResult,
 };
 
 use futures::prelude::*;
 use futures_util::{future::BoxFuture, join};
-use tokio::sync::mpsc;
 use tracing::warn;
 
 pub(crate) type ConnectionFuture<C> = futures::future::Shared<BoxFuture<'static, C>>;
@@ -56,8 +55,7 @@ pub(crate) async fn get_or_create_conn<C>(
     node: Option<AsyncClusterNode<C>>,
     params: &ClusterParams,
     conn_type: RefreshConnectionType,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    glide_connection_options: GlideConnectionOptions,
 ) -> RedisResult<AsyncClusterNode<C>>
 where
     C: ConnectionLike + Send + Clone + Sync + Connect + 'static,
@@ -73,8 +71,7 @@ where
                 None,
                 conn_type,
                 Some(node),
-                push_sender,
-                disconnect_notifier,
+                glide_connection_options,
             )
             .await
             .get_node(),
@@ -86,8 +83,7 @@ where
             None,
             conn_type,
             None,
-            push_sender,
-            disconnect_notifier,
+            glide_connection_options,
         )
         .await
         .get_node()
@@ -111,8 +107,7 @@ pub(crate) async fn connect_and_check_all_connections<C>(
     addr: &str,
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    glide_connection_options: GlideConnectionOptions,
 ) -> ConnectAndCheckResult<C>
 where
     C: ConnectionLike + Connect + Send + Sync + 'static + Clone,
@@ -122,17 +117,15 @@ where
             addr,
             params.clone(),
             socket_addr,
-            push_sender.clone(),
             false,
-            disconnect_notifier.clone(),
+            glide_connection_options.clone(),
         ),
         create_connection(
             addr,
             params.clone(),
             socket_addr,
-            push_sender,
             true,
-            disconnect_notifier,
+            glide_connection_options,
         ),
     )
     .await
@@ -188,9 +181,11 @@ where
         addr,
         params.clone(),
         socket_addr,
-        None,
         true,
-        disconnect_notifier,
+        GlideConnectionOptions {
+            push_sender: None,
+            disconnect_notifier,
+        },
     )
     .await
     {
@@ -269,8 +264,7 @@ pub async fn connect_and_check<C>(
     socket_addr: Option<SocketAddr>,
     conn_type: RefreshConnectionType,
     node: Option<AsyncClusterNode<C>>,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    glide_connection_options: GlideConnectionOptions,
 ) -> ConnectAndCheckResult<C>
 where
     C: ConnectionLike + Connect + Send + Sync + 'static + Clone,
@@ -281,8 +275,7 @@ where
                 addr,
                 params.clone(),
                 socket_addr,
-                push_sender,
-                disconnect_notifier,
+                glide_connection_options,
             )
             .await
             {
@@ -301,7 +294,7 @@ where
                         params,
                         socket_addr,
                         node,
-                        disconnect_notifier,
+                        glide_connection_options.disconnect_notifier,
                     )
                     .await
                 }
@@ -310,22 +303,15 @@ where
                         addr,
                         params,
                         socket_addr,
-                        push_sender,
-                        disconnect_notifier,
+                        glide_connection_options,
                     )
                     .await
                 }
             }
         }
         RefreshConnectionType::AllConnections => {
-            connect_and_check_all_connections(
-                addr,
-                params,
-                socket_addr,
-                push_sender,
-                disconnect_notifier,
-            )
-            .await
+            connect_and_check_all_connections(addr, params, socket_addr, glide_connection_options)
+                .await
         }
     }
 }
@@ -334,8 +320,7 @@ async fn create_and_setup_user_connection<C>(
     node: &str,
     params: ClusterParams,
     socket_addr: Option<SocketAddr>,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-    disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    glide_connection_options: GlideConnectionOptions,
 ) -> RedisResult<ConnectionWithIp<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
@@ -344,9 +329,8 @@ where
         node,
         params.clone(),
         socket_addr,
-        push_sender,
         false,
-        disconnect_notifier,
+        glide_connection_options,
     )
     .await?;
     setup_user_connection(&mut connection.conn, params).await?;
@@ -386,9 +370,8 @@ async fn create_connection<C>(
     node: &str,
     mut params: ClusterParams,
     socket_addr: Option<SocketAddr>,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     is_management: bool,
-    disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    mut glide_connection_options: GlideConnectionOptions,
 ) -> RedisResult<ConnectionWithIp<C>>
 where
     C: ConnectionLike + Connect + Send + 'static,
@@ -401,17 +384,15 @@ where
     }
     let info = get_connection_info(node, params)?;
     // management connection does not require notifications or disconnect notifications
+    if is_management {
+        glide_connection_options.disconnect_notifier = None;
+    }
     C::connect(
         info,
         response_timeout,
         connection_timeout,
         socket_addr,
-        if !is_management { push_sender } else { None },
-        if !is_management {
-            disconnect_notifier
-        } else {
-            None
-        },
+        glide_connection_options,
     )
     .await
     .map(|conn| conn.into())

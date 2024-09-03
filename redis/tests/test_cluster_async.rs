@@ -21,7 +21,7 @@ mod cluster_async {
     use std::ops::Add;
 
     use redis::{
-        aio::{ConnectionLike, DisconnectNotifier, MultiplexedConnection},
+        aio::{ConnectionLike, MultiplexedConnection},
         cluster::ClusterClient,
         cluster_async::{testing::MANAGEMENT_CONN_NAME, ClusterConnection, Connect},
         cluster_routing::{
@@ -29,9 +29,9 @@ mod cluster_async {
         },
         cluster_topology::{get_slot, DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES},
         cmd, from_owned_redis_value, parse_redis_value, AsyncCommands, Cmd, ErrorKind,
-        FromRedisValue, InfoDict, IntoConnectionInfo, ProtocolVersion, PubSubChannelOrPattern,
-        PubSubSubscriptionInfo, PubSubSubscriptionKind, PushInfo, PushKind, RedisError,
-        RedisFuture, RedisResult, Script, Value,
+        FromRedisValue, GlideConnectionOptions, InfoDict, IntoConnectionInfo, ProtocolVersion,
+        PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind, PushInfo, PushKind,
+        RedisError, RedisFuture, RedisResult, Script, Value,
     };
 
     use crate::support::*;
@@ -436,7 +436,7 @@ mod cluster_async {
                         .unwrap_or_else(|e| panic!("Failed to connect to '{addr}': {e}"));
 
                     let mut conn = client
-                        .get_multiplexed_async_connection(None, None)
+                        .get_multiplexed_async_connection(GlideConnectionOptions::default())
                         .await
                         .unwrap_or_else(|e| panic!("Failed to get connection: {e}"));
 
@@ -535,8 +535,7 @@ mod cluster_async {
             response_timeout: std::time::Duration,
             connection_timeout: std::time::Duration,
             socket_addr: Option<SocketAddr>,
-            push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-            disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+            glide_connection_options: GlideConnectionOptions,
         ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
         where
             T: IntoConnectionInfo + Send + 'a,
@@ -547,8 +546,7 @@ mod cluster_async {
                     response_timeout,
                     connection_timeout,
                     socket_addr,
-                    push_sender,
-                    disconnect_notifier,
+                    glide_connection_options,
                 )
                 .await?;
                 Ok((ErrorConnection { inner }, None))

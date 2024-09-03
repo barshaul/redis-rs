@@ -30,6 +30,7 @@ pub mod testing {
     pub use super::connections_logic::*;
 }
 use crate::{
+    client::GlideConnectionOptions,
     cluster_routing::{Routable, RoutingInfo},
     cluster_slotmap::SlotMap,
     cluster_topology::SLOT_SIZE,
@@ -57,8 +58,11 @@ use std::{
 #[cfg(feature = "tokio-comp")]
 use tokio::task::JoinHandle;
 
+#[cfg(feature = "tokio-comp")]
+use crate::aio::DisconnectNotifier;
+
 use crate::{
-    aio::{get_socket_addrs, ConnectionLike, DisconnectNotifier, MultiplexedConnection, Runtime},
+    aio::{get_socket_addrs, ConnectionLike, MultiplexedConnection, Runtime},
     cluster::slot_cmd,
     cluster_async::connections_logic::{
         get_host_and_port_from_addr, get_or_create_conn, ConnectionFuture, RefreshConnectionType,
@@ -399,10 +403,9 @@ pub(crate) struct InnerCore<C> {
     pending_requests: Mutex<Vec<PendingRequest<C>>>,
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     subscriptions_by_address: RwLock<HashMap<String, PubSubSubscriptionInfo>>,
     unassigned_subscriptions: RwLock<PubSubSubscriptionInfo>,
-    disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+    glide_connection_options: GlideConnectionOptions,
     #[cfg(feature = "tokio-comp")]
     tokio_notify: Arc<Notify>,
 }
@@ -1004,8 +1007,10 @@ where
         let connections = Self::create_initial_connections(
             initial_nodes,
             &cluster_params,
-            push_sender.clone(),
-            disconnect_notifier.clone(),
+            GlideConnectionOptions {
+                push_sender: push_sender.clone(),
+                disconnect_notifier: disconnect_notifier.clone(),
+            },
         )
         .await?;
 
@@ -1022,7 +1027,6 @@ where
             pending_requests: Mutex::new(Vec::new()),
             slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
-            push_sender: push_sender.clone(),
             unassigned_subscriptions: RwLock::new(
                 if let Some(subs) = cluster_params.pubsub_subscriptions {
                     subs.clone()
@@ -1031,7 +1035,10 @@ where
                 },
             ),
             subscriptions_by_address: RwLock::new(Default::default()),
-            disconnect_notifier: disconnect_notifier.clone(),
+            glide_connection_options: GlideConnectionOptions {
+                push_sender: push_sender.clone(),
+                disconnect_notifier: disconnect_notifier.clone(),
+            },
             #[cfg(feature = "tokio-comp")]
             tokio_notify,
         });
@@ -1125,18 +1132,16 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
         params: &ClusterParams,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<ConnectionMap<C>> {
         let initial_nodes: Vec<(String, Option<SocketAddr>)> =
             Self::try_to_expand_initial_nodes(initial_nodes).await;
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|(node_addr, socket_addr)| {
                 let mut params: ClusterParams = params.clone();
-                let push_sender = push_sender.clone();
+                let glide_connection_options = glide_connection_options.clone();
                 // set subscriptions to none, they will be applied upon the topology discovery
                 params.pubsub_subscriptions = None;
-                let disconnect_notifier = disconnect_notifier.clone();
 
                 async move {
                     let result = connect_and_check(
@@ -1145,8 +1150,7 @@ where
                         socket_addr,
                         RefreshConnectionType::AllConnections,
                         None,
-                        push_sender,
-                        disconnect_notifier,
+                        glide_connection_options,
                     )
                     .await
                     .get_node();
@@ -1192,8 +1196,7 @@ where
             let connection_map = match Self::create_initial_connections(
                 &inner.initial_nodes,
                 &inner.cluster_params,
-                None,
-                inner.disconnect_notifier.clone(),
+                inner.glide_connection_options.clone(),
             )
             .await
             {
@@ -1292,8 +1295,7 @@ where
         let connections_container = inner.conn_lock.read().await;
         let cluster_params = &inner.cluster_params;
         let subscriptions_by_address = &inner.subscriptions_by_address;
-        let push_sender = &inner.push_sender;
-        let disconnect_notifier = &inner.disconnect_notifier;
+        let glide_connection_optons = &inner.glide_connection_options;
 
         stream::iter(addresses.into_iter())
             .fold(
@@ -1315,8 +1317,7 @@ where
                         node_option,
                         &cluster_params,
                         conn_type,
-                        push_sender.clone(),
-                        disconnect_notifier.clone(),
+                        glide_connection_optons.clone(),
                     )
                     .await;
                     match node {
@@ -1769,8 +1770,7 @@ where
                         node,
                         &cluster_params,
                         RefreshConnectionType::AllConnections,
-                        inner.push_sender.clone(),
-                        inner.disconnect_notifier.clone(),
+                        inner.glide_connection_options.clone(),
                     )
                     .await;
                     if let Ok(node) = node {
@@ -2065,8 +2065,7 @@ where
                     None,
                     RefreshConnectionType::AllConnections,
                     None,
-                    core.push_sender.clone(),
-                    core.disconnect_notifier.clone(),
+                    core.glide_connection_options.clone(),
                 )
                 .await
                 .get_node()
@@ -2503,8 +2502,7 @@ pub trait Connect: Sized {
         response_timeout: Duration,
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a;
@@ -2516,8 +2514,7 @@ impl Connect for MultiplexedConnection {
         response_timeout: Duration,
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisFuture<'a, (MultiplexedConnection, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a,
@@ -2534,8 +2531,7 @@ impl Connect for MultiplexedConnection {
                         client.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
                             response_timeout,
                             socket_addr,
-                            push_sender,
-                            disconnect_notifier,
+                            glide_connection_options,
                         ),
                     )
                     .await?
@@ -2546,8 +2542,7 @@ impl Connect for MultiplexedConnection {
                         .get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
                             response_timeout,
                             socket_addr,
-                            push_sender,
-                            disconnect_notifier,
+                            glide_connection_options,
                         ))
                         .await?
                 }

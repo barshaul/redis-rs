@@ -1,4 +1,5 @@
 use super::RedisFuture;
+use crate::client::GlideConnectionOptions;
 use crate::cmd::Cmd;
 use crate::push_manager::PushManager;
 use crate::types::{RedisError, RedisResult, Value};
@@ -195,8 +196,7 @@ impl ConnectionManager {
             client.get_multiplexed_async_connection_with_timeouts(
                 response_timeout,
                 connection_timeout,
-                None,
-                None,
+                GlideConnectionOptions::default(),
             )
         })
         .await

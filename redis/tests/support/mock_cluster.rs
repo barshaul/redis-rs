@@ -1,6 +1,6 @@
 use redis::{
     cluster::{self, ClusterClient, ClusterClientBuilder},
-    ErrorKind, FromRedisValue, PushInfo, RedisError,
+    ErrorKind, FromRedisValue, GlideConnectionOptions, RedisError,
 };
 
 use std::{
@@ -18,8 +18,6 @@ use {
     redis::{IntoConnectionInfo, RedisResult, Value},
 };
 
-use tokio::sync::mpsc;
-
 #[cfg(feature = "cluster-async")]
 use redis::{aio, cluster_async, RedisFuture};
 
@@ -28,9 +26,6 @@ use futures::future;
 
 #[cfg(feature = "cluster-async")]
 use tokio::runtime::Runtime;
-
-#[cfg(feature = "aio")]
-use redis::aio::DisconnectNotifier;
 
 type Handler = Arc<dyn Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send + Sync>;
 
@@ -137,8 +132,7 @@ impl cluster_async::Connect for MockConnection {
         _response_timeout: Duration,
         _connection_timeout: Duration,
         _socket_addr: Option<SocketAddr>,
-        _push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
-        _disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+        _glide_connection_options: GlideConnectionOptions,
     ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a,
