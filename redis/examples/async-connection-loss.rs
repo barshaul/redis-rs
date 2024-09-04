@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use futures::future;
 use redis::aio::ConnectionLike;
+use redis::GlideConnectionOptions;
 use redis::RedisResult;
 use tokio::time::interval;
 
@@ -80,7 +81,14 @@ async fn main() -> RedisResult<()> {
 
     let client = redis::Client::open("redis://127.0.0.1/").unwrap();
     match mode {
-        Mode::Default => run_multi(client.get_multiplexed_tokio_connection(None).await?).await?,
+        Mode::Default => {
+            run_multi(
+                client
+                    .get_multiplexed_tokio_connection(GlideConnectionOptions::default())
+                    .await?,
+            )
+            .await?
+        }
         Mode::Reconnect => run_multi(client.get_connection_manager().await?).await?,
         #[allow(deprecated)]
         Mode::Deprecated => run_single(client.get_async_connection(None).await?).await?,

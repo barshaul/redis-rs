@@ -30,6 +30,7 @@ pub mod testing {
     pub use super::connections_logic::*;
 }
 use crate::{
+    client::GlideConnectionOptions,
     cluster_routing::{Routable, RoutingInfo},
     cluster_slotmap::SlotMap,
     cluster_topology::SLOT_SIZE,
@@ -56,6 +57,9 @@ use std::{
 };
 #[cfg(feature = "tokio-comp")]
 use tokio::task::JoinHandle;
+
+#[cfg(feature = "tokio-comp")]
+use crate::aio::DisconnectNotifier;
 
 use crate::{
     aio::{get_socket_addrs, ConnectionLike, MultiplexedConnection, Runtime},
@@ -88,9 +92,13 @@ use backoff_std_async::future::retry;
 use backoff_std_async::{Error as BackoffError, ExponentialBackoff};
 
 #[cfg(feature = "tokio-comp")]
+use async_trait::async_trait;
+#[cfg(feature = "tokio-comp")]
 use backoff_tokio::future::retry;
 #[cfg(feature = "tokio-comp")]
 use backoff_tokio::{Error as BackoffError, ExponentialBackoff};
+#[cfg(feature = "tokio-comp")]
+use tokio::{sync::Notify, time::timeout};
 
 use dispose::{Disposable, Dispose};
 use futures::{future::BoxFuture, prelude::*, ready};
@@ -370,6 +378,40 @@ where
     }
 }
 
+#[cfg(feature = "tokio-comp")]
+#[derive(Clone)]
+struct TokioDisconnectNotifier {
+    disconnect_notifier: Arc<Notify>,
+}
+
+#[cfg(feature = "tokio-comp")]
+#[async_trait]
+impl DisconnectNotifier for TokioDisconnectNotifier {
+    fn notify_disconnect(&mut self) {
+        self.disconnect_notifier.notify_one();
+    }
+
+    async fn wait_for_disconnect_with_timeout(&self, max_wait: &Duration) {
+        let _ = timeout(*max_wait, async {
+            self.disconnect_notifier.notified().await;
+        })
+        .await;
+    }
+
+    fn clone_box(&self) -> Box<dyn DisconnectNotifier> {
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(feature = "tokio-comp")]
+impl TokioDisconnectNotifier {
+    fn new() -> TokioDisconnectNotifier {
+        TokioDisconnectNotifier {
+            disconnect_notifier: Arc::new(Notify::new()),
+        }
+    }
+}
+
 type ConnectionMap<C> = connections_container::ConnectionsMap<ConnectionFuture<C>>;
 type ConnectionsContainer<C> =
     self::connections_container::ConnectionsContainer<ConnectionFuture<C>>;
@@ -380,9 +422,9 @@ pub(crate) struct InnerCore<C> {
     pending_requests: Mutex<Vec<PendingRequest<C>>>,
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
-    push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     subscriptions_by_address: RwLock<HashMap<String, PubSubSubscriptionInfo>>,
     unassigned_subscriptions: RwLock<PubSubSubscriptionInfo>,
+    glide_connection_options: GlideConnectionOptions,
 }
 
 pub(crate) type Core<C> = Arc<InnerCore<C>>;
@@ -461,11 +503,19 @@ pub(crate) struct ClusterConnInner<C> {
     refresh_error: Option<RedisError>,
     // Handler of the periodic check task.
     periodic_checks_handler: Option<JoinHandle<()>>,
+    // Handler of fast connection validation task
+    connections_validation_handler: Option<JoinHandle<()>>,
 }
 
 impl<C> Dispose for ClusterConnInner<C> {
     fn dispose(self) {
         if let Some(handle) = self.periodic_checks_handler {
+            #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
+            block_on(handle.cancel());
+            #[cfg(feature = "tokio-comp")]
+            handle.abort()
+        }
+        if let Some(handle) = self.connections_validation_handler {
             #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
             block_on(handle.cancel());
             #[cfg(feature = "tokio-comp")]
@@ -957,9 +1007,26 @@ where
         cluster_params: ClusterParams,
         push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
     ) -> RedisResult<Disposable<Self>> {
-        let connections =
-            Self::create_initial_connections(initial_nodes, &cluster_params, push_sender.clone())
-                .await?;
+        let disconnect_notifier = {
+            #[cfg(feature = "tokio-comp")]
+            {
+                Some::<Box<dyn DisconnectNotifier>>(Box::new(TokioDisconnectNotifier::new()))
+            }
+            #[cfg(not(feature = "tokio-comp"))]
+            None
+        };
+
+        let glide_connection_options = GlideConnectionOptions {
+            push_sender,
+            disconnect_notifier,
+        };
+
+        let connections = Self::create_initial_connections(
+            initial_nodes,
+            &cluster_params,
+            glide_connection_options.clone(),
+        )
+        .await?;
 
         let topology_checks_interval = cluster_params.topology_checks_interval;
         let slots_refresh_rate_limiter = cluster_params.slots_refresh_rate_limit;
@@ -974,7 +1041,6 @@ where
             pending_requests: Mutex::new(Vec::new()),
             slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
-            push_sender: push_sender.clone(),
             unassigned_subscriptions: RwLock::new(
                 if let Some(subs) = cluster_params.pubsub_subscriptions {
                     subs.clone()
@@ -983,6 +1049,7 @@ where
                 },
             ),
             subscriptions_by_address: RwLock::new(Default::default()),
+            glide_connection_options,
         });
         let mut connection = ClusterConnInner {
             inner,
@@ -990,6 +1057,7 @@ where
             refresh_error: None,
             state: ConnectionState::PollComplete,
             periodic_checks_handler: None,
+            connections_validation_handler: None,
         };
         Self::refresh_slots_and_subscriptions_with_retries(
             connection.inner.clone(),
@@ -1007,6 +1075,22 @@ where
             #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
             {
                 connection.periodic_checks_handler = Some(spawn(periodic_task));
+            }
+        }
+
+        let connections_validation_interval = cluster_params.connections_validation_interval;
+        if let Some(duration) = connections_validation_interval {
+            let connections_validation_handler =
+                ClusterConnInner::connections_validation_task(connection.inner.clone(), duration);
+            #[cfg(feature = "tokio-comp")]
+            {
+                connection.connections_validation_handler =
+                    Some(tokio::spawn(connections_validation_handler));
+            }
+            #[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
+            {
+                connection.connections_validation_handler =
+                    Some(spawn(connections_validation_handler));
             }
         }
 
@@ -1057,14 +1141,14 @@ where
     async fn create_initial_connections(
         initial_nodes: &[ConnectionInfo],
         params: &ClusterParams,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<ConnectionMap<C>> {
         let initial_nodes: Vec<(String, Option<SocketAddr>)> =
             Self::try_to_expand_initial_nodes(initial_nodes).await;
         let connections = stream::iter(initial_nodes.iter().cloned())
             .map(|(node_addr, socket_addr)| {
                 let mut params: ClusterParams = params.clone();
-                let push_sender = push_sender.clone();
+                let glide_connection_options = glide_connection_options.clone();
                 // set subscriptions to none, they will be applied upon the topology discovery
                 params.pubsub_subscriptions = None;
 
@@ -1075,7 +1159,7 @@ where
                         socket_addr,
                         RefreshConnectionType::AllConnections,
                         None,
-                        push_sender,
+                        glide_connection_options,
                     )
                     .await
                     .get_node();
@@ -1121,7 +1205,7 @@ where
             let connection_map = match Self::create_initial_connections(
                 &inner.initial_nodes,
                 &inner.cluster_params,
-                None,
+                inner.glide_connection_options.clone(),
             )
             .await
             {
@@ -1145,22 +1229,92 @@ where
         }
     }
 
+    // Validate all existing user connections and try to reconnect if nessesary.
+    // In addition, as a safety measure, drop nodes that do not have any assigned slots.
+    // This function serves as a cheap alternative to slot_refresh() and thus can be used much more frequently.
+    // The function does not discover the topology from the cluster and assumes the cached topology is valid.
+    // In addition, the validation is done by peeking at the state of the underlying transport w/o overhead of additional commands to server.
+    async fn validate_all_user_connections(inner: Arc<InnerCore<C>>) {
+        let mut all_valid_conns = HashMap::new();
+        // prep connections and clean out these w/o assigned slots, as we might have established connections to unwanted hosts
+        let mut nodes_to_delete = Vec::new();
+        let connections_container = inner.conn_lock.read().await;
+
+        let all_nodes_with_slots: HashSet<String> = connections_container
+            .slot_map
+            .addresses_for_all_nodes()
+            .iter()
+            .map(|addr| String::from(*addr))
+            .collect();
+
+        connections_container
+            .all_node_connections()
+            .for_each(|(addr, con)| {
+                if all_nodes_with_slots.contains(&addr) {
+                    all_valid_conns.insert(addr.clone(), con.clone());
+                } else {
+                    nodes_to_delete.push(addr.clone());
+                }
+            });
+
+        for addr in &nodes_to_delete {
+            connections_container.remove_node(addr);
+        }
+
+        drop(connections_container);
+
+        // identify nodes with closed connection
+        let mut addrs_to_refresh = Vec::new();
+        for (addr, con_fut) in &all_valid_conns {
+            let con = con_fut.clone().await;
+            // connection object might be present despite the transport being closed
+            if con.is_closed() {
+                // transport is closed, need to refresh
+                addrs_to_refresh.push(addr.clone());
+            }
+        }
+
+        // identify missing nodes
+        addrs_to_refresh.extend(
+            all_nodes_with_slots
+                .iter()
+                .filter(|addr| !all_valid_conns.contains_key(*addr))
+                .cloned(),
+        );
+
+        if !addrs_to_refresh.is_empty() {
+            // dont try existing nodes since we know a. it does not exist. b. exist but its connection is closed
+            Self::refresh_connections(
+                inner.clone(),
+                addrs_to_refresh,
+                RefreshConnectionType::AllConnections,
+                false,
+            )
+            .await;
+        }
+    }
+
     async fn refresh_connections(
         inner: Arc<InnerCore<C>>,
         addresses: Vec<String>,
         conn_type: RefreshConnectionType,
+        check_existing_conn: bool,
     ) {
         info!("Started refreshing connections to {:?}", addresses);
         let connections_container = inner.conn_lock.read().await;
         let cluster_params = &inner.cluster_params;
         let subscriptions_by_address = &inner.subscriptions_by_address;
-        let push_sender = &inner.push_sender;
+        let glide_connection_optons = &inner.glide_connection_options;
 
         stream::iter(addresses.into_iter())
             .fold(
                 &*connections_container,
                 |connections_container, address| async move {
-                    let node_option = connections_container.remove_node(&address);
+                    let node_option = if check_existing_conn {
+                        connections_container.remove_node(&address)
+                    } else {
+                        None
+                    };
 
                     // override subscriptions for this connection
                     let mut cluster_params = cluster_params.clone();
@@ -1172,7 +1326,7 @@ where
                         node_option,
                         &cluster_params,
                         conn_type,
-                        push_sender.clone(),
+                        glide_connection_optons.clone(),
                     )
                     .await;
                     match node {
@@ -1394,6 +1548,22 @@ where
         }
     }
 
+    async fn connections_validation_task(inner: Arc<InnerCore<C>>, interval_duration: Duration) {
+        loop {
+            if let Some(disconnect_notifier) =
+                inner.glide_connection_options.disconnect_notifier.clone()
+            {
+                disconnect_notifier
+                    .wait_for_disconnect_with_timeout(&interval_duration)
+                    .await;
+            } else {
+                let _ = boxed_sleep(interval_duration).await;
+            }
+
+            Self::validate_all_user_connections(inner.clone()).await;
+        }
+    }
+
     async fn refresh_pubsub_subscriptions(inner: Arc<InnerCore<C>>) {
         if inner.cluster_params.protocol != crate::types::ProtocolVersion::RESP3 {
             return;
@@ -1471,17 +1641,12 @@ where
         drop(subs_by_address_guard);
 
         if !addrs_to_refresh.is_empty() {
-            let conns_read_guard = inner.conn_lock.read().await;
-            // have to remove or otherwise the refresh_connection wont trigger node recreation
-            for addr_to_refresh in addrs_to_refresh.iter() {
-                conns_read_guard.remove_node(addr_to_refresh);
-            }
-            drop(conns_read_guard);
             // immediately trigger connection reestablishment
             Self::refresh_connections(
                 inner.clone(),
                 addrs_to_refresh.into_iter().collect(),
                 RefreshConnectionType::AllConnections,
+                false,
             )
             .await;
         }
@@ -1517,6 +1682,7 @@ where
                 inner,
                 failed_connections,
                 RefreshConnectionType::OnlyManagementConnection,
+                true,
             )
             .await;
         }
@@ -1615,7 +1781,7 @@ where
                         node,
                         &cluster_params,
                         RefreshConnectionType::AllConnections,
-                        inner.push_sender.clone(),
+                        inner.glide_connection_options.clone(),
                     )
                     .await;
                     if let Ok(node) = node {
@@ -1910,7 +2076,7 @@ where
                     None,
                     RefreshConnectionType::AllConnections,
                     None,
-                    core.push_sender.clone(),
+                    core.glide_connection_options.clone(),
                 )
                 .await
                 .get_node()
@@ -2221,6 +2387,7 @@ where
                             self.inner.clone(),
                             addresses,
                             RefreshConnectionType::OnlyUserConnection,
+                            true,
                         ),
                     )));
                 }
@@ -2329,7 +2496,12 @@ where
     fn get_db(&self) -> i64 {
         0
     }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
+
 /// Implements the process of connecting to a Redis server
 /// and obtaining a connection handle.
 pub trait Connect: Sized {
@@ -2341,7 +2513,7 @@ pub trait Connect: Sized {
         response_timeout: Duration,
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a;
@@ -2353,7 +2525,7 @@ impl Connect for MultiplexedConnection {
         response_timeout: Duration,
         connection_timeout: Duration,
         socket_addr: Option<SocketAddr>,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisFuture<'a, (MultiplexedConnection, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a,
@@ -2370,7 +2542,7 @@ impl Connect for MultiplexedConnection {
                         client.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
                             response_timeout,
                             socket_addr,
-                            push_sender,
+                            glide_connection_options,
                         ),
                     )
                     .await?
@@ -2381,7 +2553,7 @@ impl Connect for MultiplexedConnection {
                         .get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
                             response_timeout,
                             socket_addr,
-                            push_sender,
+                            glide_connection_options,
                         ))
                         .await?
                 }

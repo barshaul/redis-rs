@@ -1,4 +1,5 @@
 use super::RedisFuture;
+use crate::client::GlideConnectionOptions;
 use crate::cmd::Cmd;
 use crate::push_manager::PushManager;
 use crate::types::{RedisError, RedisResult, Value};
@@ -195,7 +196,7 @@ impl ConnectionManager {
             client.get_multiplexed_async_connection_with_timeouts(
                 response_timeout,
                 connection_timeout,
-                None,
+                GlideConnectionOptions::default(),
             )
         })
         .await
@@ -300,5 +301,10 @@ impl ConnectionLike for ConnectionManager {
 
     fn get_db(&self) -> i64 {
         self.client.connection_info().redis.db
+    }
+
+    fn is_closed(&self) -> bool {
+        // always return false due to automatic reconnect
+        false
     }
 }

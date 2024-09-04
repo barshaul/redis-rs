@@ -1,5 +1,8 @@
 use std::time::Duration;
 
+#[cfg(feature = "aio")]
+use crate::aio::DisconnectNotifier;
+
 use crate::{
     connection::{connect, Connection, ConnectionInfo, ConnectionLike, IntoConnectionInfo},
     push_manager::PushInfo,
@@ -75,6 +78,16 @@ impl Client {
     }
 }
 
+/// Glide-specific connection options
+#[derive(Clone, Default)]
+pub struct GlideConnectionOptions {
+    /// Queue for RESP3 notifications
+    pub push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+    #[cfg(feature = "aio")]
+    /// Passive disconnect notifier
+    pub disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
+}
+
 /// To enable async support you need to chose one of the supported runtimes and active its
 /// corresponding feature: `tokio-comp` or `async-std-comp`
 #[cfg(feature = "aio")]
@@ -146,12 +159,12 @@ impl Client {
     )]
     pub async fn get_multiplexed_async_connection(
         &self,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         self.get_multiplexed_async_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
-            push_sender,
+            glide_connection_options,
         )
         .await
     }
@@ -166,7 +179,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let result = match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
@@ -176,7 +189,7 @@ impl Client {
                     self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
                         response_timeout,
                         None,
-                        push_sender,
+                        glide_connection_options,
                     ),
                 )
                 .await
@@ -188,7 +201,7 @@ impl Client {
                     self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
                         response_timeout,
                         None,
-                        push_sender,
+                        glide_connection_options,
                     ),
                 )
                 .await
@@ -212,7 +225,7 @@ impl Client {
     )]
     pub async fn get_multiplexed_async_connection_and_ip(
         &self,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(crate::aio::MultiplexedConnection, Option<IpAddr>)> {
         match Runtime::locate() {
             #[cfg(feature = "tokio-comp")]
@@ -220,7 +233,7 @@ impl Client {
                 self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
                     Duration::MAX,
                     None,
-                    push_sender,
+                    glide_connection_options,
                 )
                 .await
             }
@@ -229,7 +242,7 @@ impl Client {
                 self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
                     Duration::MAX,
                     None,
-                    push_sender,
+                    glide_connection_options,
                 )
                 .await
             }
@@ -246,7 +259,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let result = Runtime::locate()
             .timeout(
@@ -254,7 +267,7 @@ impl Client {
                 self.get_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
                     response_timeout,
                     None,
-                    push_sender,
+                    glide_connection_options,
                 ),
             )
             .await;
@@ -274,12 +287,12 @@ impl Client {
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
     pub async fn get_multiplexed_tokio_connection(
         &self,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         self.get_multiplexed_tokio_connection_with_response_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
-            push_sender,
+            glide_connection_options,
         )
         .await
     }
@@ -294,7 +307,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         connection_timeout: std::time::Duration,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         let result = Runtime::locate()
             .timeout(
@@ -302,7 +315,7 @@ impl Client {
                 self.get_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
                     response_timeout,
                     None,
-                    push_sender,
+                    glide_connection_options,
                 ),
             )
             .await;
@@ -322,12 +335,12 @@ impl Client {
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
     pub async fn get_multiplexed_async_std_connection(
         &self,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<crate::aio::MultiplexedConnection> {
         self.get_multiplexed_async_std_connection_with_timeouts(
             std::time::Duration::MAX,
             std::time::Duration::MAX,
-            push_sender,
+            glide_connection_options,
         )
         .await
     }
@@ -343,7 +356,7 @@ impl Client {
     pub async fn create_multiplexed_tokio_connection_with_response_timeout(
         &self,
         response_timeout: std::time::Duration,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -351,7 +364,7 @@ impl Client {
         self.create_multiplexed_async_connection_inner::<crate::aio::tokio::Tokio>(
             response_timeout,
             None,
-            push_sender,
+            glide_connection_options,
         )
         .await
         .map(|(conn, driver, _ip)| (conn, driver))
@@ -366,14 +379,14 @@ impl Client {
     #[cfg_attr(docsrs, doc(cfg(feature = "tokio-comp")))]
     pub async fn create_multiplexed_tokio_connection(
         &self,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
         self.create_multiplexed_tokio_connection_with_response_timeout(
             std::time::Duration::MAX,
-            push_sender,
+            glide_connection_options,
         )
         .await
         .map(|conn_res| (conn_res.0, conn_res.1))
@@ -390,7 +403,7 @@ impl Client {
     pub async fn create_multiplexed_async_std_connection_with_response_timeout(
         &self,
         response_timeout: std::time::Duration,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -398,7 +411,7 @@ impl Client {
         self.create_multiplexed_async_connection_inner::<crate::aio::async_std::AsyncStd>(
             response_timeout,
             None,
-            push_sender,
+            glide_connection_options,
         )
         .await
         .map(|(conn, driver, _ip)| (conn, driver))
@@ -413,14 +426,14 @@ impl Client {
     #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
     pub async fn create_multiplexed_async_std_connection(
         &self,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
     )> {
         self.create_multiplexed_async_std_connection_with_response_timeout(
             std::time::Duration::MAX,
-            push_sender,
+            glide_connection_options,
         )
         .await
     }
@@ -623,7 +636,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(crate::aio::MultiplexedConnection, Option<IpAddr>)>
     where
         T: crate::aio::RedisRuntime,
@@ -632,7 +645,7 @@ impl Client {
             .create_multiplexed_async_connection_inner::<T>(
                 response_timeout,
                 socket_addr,
-                push_sender,
+                glide_connection_options,
             )
             .await?;
         T::spawn(driver);
@@ -643,7 +656,7 @@ impl Client {
         &self,
         response_timeout: std::time::Duration,
         socket_addr: Option<SocketAddr>,
-        push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<(
         crate::aio::MultiplexedConnection,
         impl std::future::Future<Output = ()>,
@@ -657,7 +670,7 @@ impl Client {
             &self.connection_info,
             con,
             response_timeout,
-            push_sender,
+            glide_connection_options,
         )
         .await
         .map(|res| (res.0, res.1, ip))

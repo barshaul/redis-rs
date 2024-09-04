@@ -29,9 +29,9 @@ mod cluster_async {
         },
         cluster_topology::{get_slot, DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES},
         cmd, from_owned_redis_value, parse_redis_value, AsyncCommands, Cmd, ErrorKind,
-        FromRedisValue, InfoDict, IntoConnectionInfo, ProtocolVersion, PubSubChannelOrPattern,
-        PubSubSubscriptionInfo, PubSubSubscriptionKind, PushInfo, PushKind, RedisError,
-        RedisFuture, RedisResult, Script, Value,
+        FromRedisValue, GlideConnectionOptions, InfoDict, IntoConnectionInfo, ProtocolVersion,
+        PubSubChannelOrPattern, PubSubSubscriptionInfo, PubSubSubscriptionKind, PushInfo, PushKind,
+        RedisError, RedisFuture, RedisResult, Script, Value,
     };
 
     use crate::support::*;
@@ -42,6 +42,60 @@ mod cluster_async {
             std::io::ErrorKind::BrokenPipe,
             "mock-io-error",
         ))
+    }
+
+    fn validate_subscriptions(
+        pubsub_subs: &PubSubSubscriptionInfo,
+        notifications_rx: &mut mpsc::UnboundedReceiver<PushInfo>,
+        allow_disconnects: bool,
+    ) {
+        let mut subscribe_cnt =
+            if let Some(exact_subs) = pubsub_subs.get(&PubSubSubscriptionKind::Exact) {
+                exact_subs.len()
+            } else {
+                0
+            };
+
+        let mut psubscribe_cnt =
+            if let Some(pattern_subs) = pubsub_subs.get(&PubSubSubscriptionKind::Pattern) {
+                pattern_subs.len()
+            } else {
+                0
+            };
+
+        let mut ssubscribe_cnt =
+            if let Some(sharded_subs) = pubsub_subs.get(&PubSubSubscriptionKind::Sharded) {
+                sharded_subs.len()
+            } else {
+                0
+            };
+
+        for _ in 0..(subscribe_cnt + psubscribe_cnt + ssubscribe_cnt) {
+            let result = notifications_rx.try_recv();
+            assert!(result.is_ok());
+            let PushInfo { kind, data: _ } = result.unwrap();
+            assert!(
+                kind == PushKind::Subscribe
+                    || kind == PushKind::PSubscribe
+                    || kind == PushKind::SSubscribe
+                    || if allow_disconnects {
+                        kind == PushKind::Disconnection
+                    } else {
+                        false
+                    }
+            );
+            if kind == PushKind::Subscribe {
+                subscribe_cnt -= 1;
+            } else if kind == PushKind::PSubscribe {
+                psubscribe_cnt -= 1;
+            } else if kind == PushKind::SSubscribe {
+                ssubscribe_cnt -= 1;
+            }
+        }
+
+        assert!(subscribe_cnt == 0);
+        assert!(psubscribe_cnt == 0);
+        assert!(ssubscribe_cnt == 0);
     }
 
     #[test]
@@ -382,7 +436,7 @@ mod cluster_async {
                         .unwrap_or_else(|e| panic!("Failed to connect to '{addr}': {e}"));
 
                     let mut conn = client
-                        .get_multiplexed_async_connection(None)
+                        .get_multiplexed_async_connection(GlideConnectionOptions::default())
                         .await
                         .unwrap_or_else(|e| panic!("Failed to get connection: {e}"));
 
@@ -481,7 +535,7 @@ mod cluster_async {
             response_timeout: std::time::Duration,
             connection_timeout: std::time::Duration,
             socket_addr: Option<SocketAddr>,
-            push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+            glide_connection_options: GlideConnectionOptions,
         ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
         where
             T: IntoConnectionInfo + Send + 'a,
@@ -492,7 +546,7 @@ mod cluster_async {
                     response_timeout,
                     connection_timeout,
                     socket_addr,
-                    push_sender,
+                    glide_connection_options,
                 )
                 .await?;
                 Ok((ErrorConnection { inner }, None))
@@ -520,6 +574,10 @@ mod cluster_async {
 
         fn get_db(&self) -> i64 {
             self.inner.get_db()
+        }
+
+        fn is_closed(&self) -> bool {
+            true
         }
     }
 
@@ -2683,546 +2741,522 @@ mod cluster_async {
     }
 
     #[test]
-    fn test_async_cluster_restore_resp3_pubsub_state_after_complete_server_disconnect() {
-        // let cluster = TestClusterContext::new_with_cluster_client_builder(
-        //     3,
-        //     0,
-        //     |builder| builder.retries(3).use_protocol(ProtocolVersion::RESP3),
-        //     //|builder| builder.retries(3),
-        //     false,
-        // );
+    fn test_async_cluster_test_fast_reconnect() {
+        // Note the 3 seconds connection check to differentiate between notifications and periodic
+        let cluster = TestClusterContext::new_with_cluster_client_builder(
+            3,
+            0,
+            |builder| {
+                builder
+                    .retries(0)
+                    .periodic_connections_checks(Duration::from_secs(3))
+            },
+            false,
+        );
 
-        // block_on_all(async move {
-        //     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PushInfo>();
-        //     let mut connection = cluster.async_connection(Some(tx.clone())).await;
-        //     // assuming the implementation of TestCluster assigns the slots monotonicaly incerasing with the nodes
-        //     let route_0 = redis::cluster_routing::Route::new(0, redis::cluster_routing::SlotAddr::Master);
-        //     let node_0_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(route_0);
-        //     let route_2 = redis::cluster_routing::Route::new(16 * 1024 - 1, redis::cluster_routing::SlotAddr::Master);
-        //     let node_2_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(route_2);
+        // For tokio-comp, do 3 consequtive disconnects and ensure reconnects succeeds in less than 100ms,
+        // which is more than enough for local connections even with TLS.
+        // More than 1 run is done to ensure it is the fast reconnect notification that trigger the reconnect
+        // and not the periodic interval.
+        // For other async implementation, only periodic connection check is available, hence,
+        // do 1 run sleeping for periodic connection check interval, allowing it to reestablish connections
+        block_on_all(async move {
+            let mut disconnecting_con = cluster.async_connection(None).await;
+            let mut monitoring_con = cluster.async_connection(None).await;
 
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("SUBSCRIBE").arg("test_channel"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     //.route_command(&redis::Cmd::new().arg("SUBSCRIBE").arg("test_channel"), RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
-        //     .await;
+            #[cfg(feature = "tokio-comp")]
+            let tries = 0..3;
+            #[cfg(not(feature = "tokio-comp"))]
+            let tries = 0..1;
 
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Push {
-        //             kind: PushKind::Subscribe,
-        //             data: vec![Value::BulkString("test_channel".into()), Value::Int(1)],
-        //         })
-        //     );
+            for _ in tries {
+                // get connection id
+                let mut cmd = redis::cmd("CLIENT");
+                cmd.arg("ID");
+                let res = disconnecting_con
+                    .route_command(
+                        &cmd,
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                            0,
+                            SlotAddr::Master,
+                        ))),
+                    )
+                    .await;
+                assert!(res.is_ok());
+                let res = res.unwrap();
+                let id = {
+                    match res {
+                        Value::Int(id) => id,
+                        _ => {
+                            panic!("Wrong return value for CLIENT ID command: {:?}", res);
+                        }
+                    }
+                };
 
-        //     // pull out all the subscribe notification, this push notification is due to the previous subscribe command
-        //     let result = rx.recv().await;
-        //     assert!(result.is_some());
-        //     let PushInfo { kind, data } = result.unwrap();
-        //     assert_eq!(
-        //         (kind, data),
-        //         (
-        //             PushKind::Subscribe,
-        //             vec![
-        //                 Value::BulkString("test_channel".as_bytes().to_vec()),
-        //                 Value::Int(1),
-        //             ]
-        //         )
-        //     );
+                // ask server to kill the connection
+                let mut cmd = redis::cmd("CLIENT");
+                cmd.arg("KILL").arg("ID").arg(id).arg("SKIPME").arg("NO");
+                let res = disconnecting_con
+                    .route_command(
+                        &cmd,
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                            0,
+                            SlotAddr::Master,
+                        ))),
+                    )
+                    .await;
+                // assert server has closed connection
+                assert_eq!(res, Ok(Value::Int(1)));
 
-        //     // ensure subscription, routing on the same node, expected return Int(1)
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel").arg("test_message_from_node_0"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
+                #[cfg(feature = "tokio-comp")]
+                // ensure reconnect happened in less than 100ms
+                sleep(futures_time::time::Duration::from_millis(100)).await;
 
-        //     // ensure subscription, routing on different node, expected return Int(0)
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel").arg("test_message_from_node_2"), RoutingInfo::SingleNode(node_2_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(0))
-        //     );
+                #[cfg(not(feature = "tokio-comp"))]
+                // no fast notification is available, wait for 1 periodic check + overhead
+                sleep(futures_time::time::Duration::from_secs(3 + 1)).await;
 
-        //     for i in vec![0, 2] {
-        //         let result = rx.recv().await;
-        //         assert!(result.is_some());
-        //         let PushInfo { kind, data } = result.unwrap();
-        //         println!("^^^^^^^^^ '{:?} -> {:?}'", kind, data);
-        //         assert_eq!(
-        //             (kind, data),
-        //             (
-        //                 PushKind::Message,
-        //                 vec![
-        //                     Value::BulkString("test_channel".into()),
-        //                     Value::BulkString(format!("test_message_from_node_{}", i).into()),
-        //                 ]
-        //             )
-        //         );
-        //     }
-
-        //     // drop and recreate cluster and connections
-        //     drop(cluster);
-        //     println!("*********** DROPPED **********");
-
-        //     let cluster = TestClusterContext::new_with_cluster_client_builder(
-        //         3,
-        //         0,
-        //         |builder| builder.retries(3).use_protocol(ProtocolVersion::RESP3),
-        //         //|builder| builder.retries(3),
-        //         false,
-        //     );
-
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel").arg("test_message_from_node_0"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
-
-        //     //sleep(futures_time::time::Duration::from_secs(15)).await;
-        //     //return Ok(());
-
-        //     let cluster = TestClusterContext::new_with_cluster_client_builder(
-        //         3,
-        //         0,
-        //         |builder| builder.retries(3).use_protocol(ProtocolVersion::RESP3),
-        //         //|builder| builder.retries(3),
-        //         false,
-        //     );
-
-        //     // ensure subscription state restore
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel").arg("test_message_from_node_0"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
-
-        //     // non-subscribed channel
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_1").arg("should_not_receive"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(0))
-        //     );
-
-        //     // ensure subscription, routing on different node, expected return Int(0)
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel").arg("test_message_from_node_2"), RoutingInfo::SingleNode(node_2_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(0))
-        //     );
-
-        //     // should produce an arbitrary number of 'disconnected' notifications - 1 for the intitial try after the drop and an unknown? amout during reconnecting procedure
-        //     // Notifications become available ONLY after we try to send the commands, since push manager does not register TCP disconnect on a idle socket
-        //     // Remove the any amount of 'disconnected' notifications
-        //     sleep(futures_time::time::Duration::from_secs(1)).await;
-        //     //let mut result = rx.recv().await;
-        //     let mut result = rx.try_recv();
-        //     assert!(result.is_ok());
-        //     //assert!(result.is_some());
-        //     loop {
-        //         let kind = result.clone().unwrap().kind;
-        //         if kind != PushKind::Disconnection && kind != PushKind::Subscribe {
-        //             break;
-        //         }
-        //         // result = rx.recv().await;
-        //         // assert!(result.is_some());
-        //         result = rx.try_recv();
-        //         assert!(result.is_ok());
-        //     }
-
-        //     // ensure messages test_message_from_node_0 and test_message_from_node_2
-        //     let mut msg_from_0 = false;
-        //     let mut msg_from_2 = false;
-        //     while !msg_from_0 && !msg_from_2 {
-        //         let mut result = rx.recv().await;
-        //         assert!(result.is_some());
-        //         let PushInfo { kind, data } = result.unwrap();
-
-        //         assert!(kind == PushKind::Disconnection || kind == PushKind::Subscribe || kind == PushKind::Message);
-        //         if kind == PushKind::Disconnection || kind == PushKind::Subscribe {
-        //             // ignore
-        //             continue;
-        //         }
-
-        //         if data == vec![
-        //             Value::BulkString("test_channel".into()),
-        //             Value::BulkString("test_message_from_node_0".into())] {
-        //             assert!(!msg_from_0);
-        //             msg_from_0 = true;
-        //         }
-        //         else if data == vec![
-        //             Value::BulkString("test_channel".into()),
-        //             Value::BulkString("test_message_from_node_2".into())] {
-        //             assert!(!msg_from_2);
-        //             msg_from_2 = true;
-        //         }
-        //         else {
-        //             assert!(false, "Unexpected message received");
-        //         }
-        //     }
-
-        //     // let mut msg_from_0 = false;
-        //     // let mut msg_from_2 = false;
-        //     // while !msg_from_2 {
-        //     //     let mut result = rx.recv().await;
-        //     //     assert!(result.is_some());
-        //     //     let PushInfo { kind, data } = result.unwrap();
-
-        //     //     assert!(kind == PushKind::Disconnection || kind == PushKind::Subscribe || kind == PushKind::Message);
-        //     //     if kind == PushKind::Disconnection || kind == PushKind::Subscribe {
-        //     //         // ignore
-        //     //         continue;
-        //     //     }
-
-        //     //     if data == vec![
-        //     //         Value::BulkString("test_channel".into()),
-        //     //         Value::BulkString("test_message_from_node_2".into())] {
-        //     //         assert!(!msg_from_2);
-        //     //         msg_from_2 = true;
-        //     //     }
-        //     //     else {
-        //     //         assert!(false, "Unexpected message received");
-        //     //     }
-        //     // }
-
-        //     Ok(())
-        // })
-        // .unwrap();
+                let mut cmd = redis::cmd("CLIENT");
+                cmd.arg("LIST").arg("TYPE").arg("NORMAL");
+                let res = monitoring_con
+                    .route_command(
+                        &cmd,
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                            0,
+                            SlotAddr::Master,
+                        ))),
+                    )
+                    .await;
+                assert!(res.is_ok());
+                let res = res.unwrap();
+                let client_list: String = {
+                    match res {
+                        // RESP2
+                        Value::BulkString(client_info) => {
+                            // ensure 4 connections - 2 for each client, its save to unwrap here
+                            String::from_utf8(client_info).unwrap()
+                        }
+                        // RESP3
+                        Value::VerbatimString { format: _, text } => text,
+                        _ => {
+                            panic!("Wrong return type for CLIENT LIST command: {:?}", res);
+                        }
+                    }
+                };
+                assert_eq!(client_list.chars().filter(|&x| x == '\n').count(), 4);
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
-    fn test_async_cluster_restore_resp3_pubsub_state_after_scale_in() {
+    fn test_async_cluster_restore_resp3_pubsub_state_passive_disconnect() {
+        let redis_ver = std::env::var("REDIS_VERSION").unwrap_or_default();
+        let use_sharded = redis_ver.starts_with("7.");
 
-        // let client_subscriptions = PubSubSubscriptionInfo::from(
-        //     [
-        //         (PubSubSubscriptionKind::Exact, HashSet::from(
-        //             [
-        //                 // test_channel_? is used as it maps to the last node in both 3 and 6 node config
-        //                 // (assuming slots allocation is monotonicaly increasing starting from node 0)
-        //                 PubSubChannelOrPattern::from(b"test_channel_?")
-        //             ])
-        //         )
-        //     ]
-        // );
+        let mut client_subscriptions = PubSubSubscriptionInfo::from([(
+            PubSubSubscriptionKind::Exact,
+            HashSet::from([PubSubChannelOrPattern::from("test_channel".as_bytes())]),
+        )]);
 
-        // let cluster = TestClusterContext::new_with_cluster_client_builder(
-        //     6,
-        //     0,
-        //     |builder| builder
-        //     .retries(3)
-        //     .use_protocol(ProtocolVersion::RESP3)
-        //     .pubsub_subscriptions(client_subscriptions.clone()),
-        //     false,
-        // );
+        if use_sharded {
+            client_subscriptions.insert(
+                PubSubSubscriptionKind::Sharded,
+                HashSet::from([PubSubChannelOrPattern::from("test_channel_?".as_bytes())]),
+            );
+        }
 
-        // block_on_all(async move {
-        //     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PushInfo>();
-        //     let mut connection = cluster.async_connection(Some(tx.clone())).await;
+        // note topology change detection is not activated since no topology change is expected
+        let cluster = TestClusterContext::new_with_cluster_client_builder(
+            3,
+            0,
+            |builder| {
+                builder
+                    .retries(3)
+                    .use_protocol(ProtocolVersion::RESP3)
+                    .pubsub_subscriptions(client_subscriptions.clone())
+                    .periodic_connections_checks(Duration::from_secs(1))
+            },
+            false,
+        );
 
-        //     // short sleep to allow the server to push subscription notification
-        //     sleep(futures_time::time::Duration::from_secs(1)).await;
-        //     let result = rx.try_recv();
-        //     assert!(result.is_ok());
-        //     let PushInfo { kind, data } = result.unwrap();
-        //     assert_eq!(
-        //         (kind, data),
-        //         (
-        //             PushKind::Subscribe,
-        //             vec![
-        //                 Value::BulkString("test_channel_?".into()),
-        //                 Value::Int(1),
-        //             ]
-        //         )
-        //     );
+        block_on_all(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PushInfo>();
+            let mut _listening_con = cluster.async_connection(Some(tx.clone())).await;
+            // Note, publishing connection has the same pubsub config
+            let mut publishing_con = cluster.async_connection(None).await;
 
-        //     let slot_14212 = get_slot(b"test_channel_?");
-        //     assert_eq!(slot_14212, 14212);
-        //     let slot_14212_route = redis::cluster_routing::Route::new(slot_14212, redis::cluster_routing::SlotAddr::Master);
-        //     let node_5_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_14212_route);
+            // short sleep to allow the server to push subscription notification
+            sleep(futures_time::time::Duration::from_secs(1)).await;
 
-        //     let result = connection
-        //     //.route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_msg"), RoutingInfo::SingleNode(node_5_route.clone()))
-        //     .route_command(&redis::Cmd::new().arg("PING"), RoutingInfo::SingleNode(node_5_route.clone()))
-        //     .await;
-        //     // let slot_0_route = redis::cluster_routing::Route::new(0, redis::cluster_routing::SlotAddr::Master);
-        //     // let node_0_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_0_route);
+            // validate subscriptions
+            validate_subscriptions(&client_subscriptions, &mut rx, false);
 
-        //     let result = cmd("PUBLISH")
-        //     .arg("test_channel_?")
-        //     .arg("test_message")
-        //     .query_async(&mut connection)
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
+            // validate PUBLISH
+            let result = cmd("PUBLISH")
+                .arg("test_channel")
+                .arg("test_message")
+                .query_async(&mut publishing_con)
+                .await;
+            assert_eq!(
+                result,
+                Ok(Value::Int(2)) // 2 connections with the same pubsub config
+            );
 
-        //     sleep(futures_time::time::Duration::from_secs(1)).await;
-        //     let result = rx.try_recv();
-        //     assert!(result.is_ok());
-        //     let PushInfo { kind, data } = result.unwrap();
-        //     assert_eq!(
-        //         (kind, data),
-        //         (
-        //             PushKind::Message,
-        //             vec![
-        //                 Value::BulkString("test_channel_?".into()),
-        //                 Value::BulkString(format!("test_message").into()),
-        //             ]
-        //         )
-        //     );
+            sleep(futures_time::time::Duration::from_secs(1)).await;
+            let result = rx.try_recv();
+            assert!(result.is_ok());
+            let PushInfo { kind, data } = result.unwrap();
+            assert_eq!(
+                (kind, data),
+                (
+                    PushKind::Message,
+                    vec![
+                        Value::BulkString("test_channel".into()),
+                        Value::BulkString("test_message".into()),
+                    ]
+                )
+            );
 
-        //     // simulate scale in
-        //     drop(cluster);
-        //     println!("*********** DROPPED **********");
-        //     let cluster = TestClusterContext::new_with_cluster_client_builder(
-        //         3,
-        //         0,
-        //         |builder| builder
-        //         .retries(6)
-        //         .use_protocol(ProtocolVersion::RESP3)
-        //         .pubsub_subscriptions(client_subscriptions.clone()),
-        //         false,
-        //     );
+            if use_sharded {
+                // validate SPUBLISH
+                let result = cmd("SPUBLISH")
+                    .arg("test_channel_?")
+                    .arg("test_message")
+                    .query_async(&mut publishing_con)
+                    .await;
+                assert_eq!(
+                    result,
+                    Ok(Value::Int(2)) // 2 connections with the same pubsub config
+                );
 
-        //     sleep(futures_time::time::Duration::from_secs(3)).await;
+                sleep(futures_time::time::Duration::from_secs(1)).await;
+                let result = rx.try_recv();
+                assert!(result.is_ok());
+                let PushInfo { kind, data } = result.unwrap();
+                assert_eq!(
+                    (kind, data),
+                    (
+                        PushKind::SMessage,
+                        vec![
+                            Value::BulkString("test_channel_?".into()),
+                            Value::BulkString("test_message".into()),
+                        ]
+                    )
+                );
+            }
 
-        //     //ensure subscription notification due to resubscription
-        //     // let result = cmd("PUBLISH")
-        //     // .arg("test_channel_?")
-        //     // .arg("test_message")
-        //     // .query_async(&mut connection)
-        //     // .await;
-        //     let result = connection
-        //     //.route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_msg"), RoutingInfo::SingleNode(node_5_route.clone()))
-        //     .route_command(&redis::Cmd::new().arg("PING"), RoutingInfo::SingleNode(node_5_route.clone()))
-        //     .await;
-        //     // assert_eq!(
-        //     //     result,
-        //     //     Ok(Value::Int(1))
-        //     // );
+            // simulate passive disconnect
+            drop(cluster);
 
-        //     let slot_14212 = get_slot(b"test_channel_?");
-        //     assert_eq!(slot_14212, 14212);
-        //     let slot_14212_route = redis::cluster_routing::Route::new(slot_14212, redis::cluster_routing::SlotAddr::Master);
-        //     let node_2_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_14212_route);
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_message"), RoutingInfo::SingleNode(node_2_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
+            // recreate the cluster, the assumtion is that the cluster is built with exactly the same params (ports, slots map...)
+            let _cluster =
+                TestClusterContext::new_with_cluster_client_builder(3, 0, |builder| builder, false);
 
-        //     sleep(futures_time::time::Duration::from_secs(1)).await;
-        //     let result = rx.try_recv();
-        //     assert!(result.is_ok());
-        //     let PushInfo { kind, data } = result.unwrap();
-        //     assert_eq!(
-        //         (kind, data),
-        //         (
-        //             PushKind::Subscribe,
-        //             vec![
-        //                 Value::BulkString("test_channel_?".into()),
-        //                 Value::Int(1),
-        //             ]
-        //         )
-        //     );
+            // sleep for 1 periodic_connections_checks + overhead
+            sleep(futures_time::time::Duration::from_secs(1 + 1)).await;
 
-        //     let result = rx.try_recv();
-        //     assert!(result.is_ok());
-        //     let PushInfo { kind, data } = result.unwrap();
-        //     assert_eq!(
-        //         (kind, data),
-        //         (
-        //             PushKind::Disconnection,
-        //             vec![],
-        //         )
-        //     );
+            // new subscription notifications due to resubscriptions
+            validate_subscriptions(&client_subscriptions, &mut rx, true);
 
-        //     return Ok(());
+            // validate PUBLISH
+            let result = cmd("PUBLISH")
+                .arg("test_channel")
+                .arg("test_message")
+                .query_async(&mut publishing_con)
+                .await;
+            assert_eq!(
+                result,
+                Ok(Value::Int(2)) // 2 connections with the same pubsub config
+            );
 
-        //     // Subscribe on the slot 14212, this slot will reside on the last node in both 3 and 6 nodes cluster,
-        //     // When the cluster is recreated with 3 nodes, this slot will reside on different network address.
-        //     // Assuming the implementation of TestCluster assigns the slots monotonicaly incerasing with the nodes
-        //     let slot_14212 = get_slot(b"test_channel_?");
-        //     assert_eq!(slot_14212, 14212);
-        //     let slot_14212_route = redis::cluster_routing::Route::new(slot_14212, redis::cluster_routing::SlotAddr::Master);
-        //     let node_5_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_14212_route);
+            sleep(futures_time::time::Duration::from_secs(1)).await;
+            let result = rx.try_recv();
+            assert!(result.is_ok());
+            let PushInfo { kind, data } = result.unwrap();
+            assert_eq!(
+                (kind, data),
+                (
+                    PushKind::Message,
+                    vec![
+                        Value::BulkString("test_channel".into()),
+                        Value::BulkString("test_message".into()),
+                    ]
+                )
+            );
 
-        //     let slot_0_route = redis::cluster_routing::Route::new(0, redis::cluster_routing::SlotAddr::Master);
-        //     let node_0_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_0_route);
+            if use_sharded {
+                // validate SPUBLISH
+                let result = cmd("SPUBLISH")
+                    .arg("test_channel_?")
+                    .arg("test_message")
+                    .query_async(&mut publishing_con)
+                    .await;
+                assert_eq!(
+                    result,
+                    Ok(Value::Int(2)) // 2 connections with the same pubsub config
+                );
 
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("SUBSCRIBE").arg("test_channel_?"), RoutingInfo::SingleNode(node_5_route.clone()))
-        //     //.route_command(&redis::Cmd::new().arg("SUBSCRIBE").arg("test_channel"), RoutingInfo::SingleNode(SingleNodeRoutingInfo::Random))
-        //     .await;
+                sleep(futures_time::time::Duration::from_secs(1)).await;
+                let result = rx.try_recv();
+                assert!(result.is_ok());
+                let PushInfo { kind, data } = result.unwrap();
+                assert_eq!(
+                    (kind, data),
+                    (
+                        PushKind::SMessage,
+                        vec![
+                            Value::BulkString("test_channel_?".into()),
+                            Value::BulkString("test_message".into()),
+                        ]
+                    )
+                );
+            }
 
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Push {
-        //             kind: PushKind::Subscribe,
-        //             data: vec![Value::BulkString("test_channel_?".into()), Value::Int(1)],
-        //         })
-        //     );
-
-        //     // pull out all the subscribe notification, this push notification is due to the previous subscribe command
-        //     let result = rx.recv().await;
-        //     assert!(result.is_some());
-        //     let PushInfo { kind, data } = result.unwrap();
-        //     assert_eq!(
-        //         (kind, data),
-        //         (
-        //             PushKind::Subscribe,
-        //             vec![
-        //                 Value::BulkString("test_channel_?".as_bytes().to_vec()),
-        //                 Value::Int(1),
-        //             ]
-        //         )
-        //     );
-
-        //     // ensure subscription, routing on the last node, expected return Int(1)
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_message_from_node_5"), RoutingInfo::SingleNode(node_5_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
-
-        //     // ensure subscription, routing on the first node, expected return Int(0)
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_message_from_node_0"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(0))
-        //     );
-
-        //     for i in vec![5, 0] {
-        //         let result = rx.recv().await;
-        //         assert!(result.is_some());
-        //         let PushInfo { kind, data } = result.unwrap();
-        //         println!("^^^^^^^^^ '{:?} -> {:?}'", kind, data);
-        //         assert_eq!(
-        //             (kind, data),
-        //             (
-        //                 PushKind::Message,
-        //                 vec![
-        //                     Value::BulkString("test_channel_?".into()),
-        //                     Value::BulkString(format!("test_message_from_node_{}", i).into()),
-        //                 ]
-        //             )
-        //         );
-        //     }
-
-        //     // drop and recreate cluster and connections
-        //     drop(cluster);
-        //     println!("*********** DROPPED **********");
-
-        //     let cluster = TestClusterContext::new_with_cluster_client_builder(
-        //         3,
-        //         0,
-        //         |builder| builder.retries(3).use_protocol(ProtocolVersion::RESP3),
-        //         //|builder| builder.retries(3),
-        //         false,
-        //     );
-
-        //     // ensure subscription state restore
-        //     let node_2_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_14212_route);
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_message_from_node_2"), RoutingInfo::SingleNode(node_2_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(1))
-        //     );
-
-        //     // non-subscribed channel
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_1").arg("should_not_receive"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(0))
-        //     );
-
-        //     // ensure subscription, routing on different node, expected return Int(0)
-        //     let result = connection
-        //     .route_command(&redis::Cmd::new().arg("PUBLISH").arg("test_channel_?").arg("test_message_from_node_2"), RoutingInfo::SingleNode(node_0_route.clone()))
-        //     .await;
-        //     assert_eq!(
-        //         result,
-        //         Ok(Value::Int(0))
-        //     );
-
-        //     // should produce an arbitrary number of 'disconnected' notifications - 1 for the intitial try after the drop and an unknown? amout during reconnecting procedure
-        //     // Notifications become available ONLY after we try to send the commands, since push manager does not register TCP disconnect on a idle socket
-        //     // Remove the any amount of 'disconnected' notifications
-        //     sleep(futures_time::time::Duration::from_secs(1)).await;
-        //     //let mut result = rx.recv().await;
-        //     let mut result = rx.try_recv();
-        //     assert!(result.is_ok());
-        //     //assert!(result.is_some());
-        //     loop {
-        //         let kind = result.clone().unwrap().kind;
-        //         if kind != PushKind::Disconnection && kind != PushKind::Subscribe {
-        //             break;
-        //         }
-        //         // result = rx.recv().await;
-        //         // assert!(result.is_some());
-        //         result = rx.try_recv();
-        //         assert!(result.is_ok());
-        //     }
-
-        //     // ensure messages test_message_from_node_0 and test_message_from_node_2
-        //     let mut msg_from_0 = false;
-        //     let mut msg_from_2 = false;
-        //     while !msg_from_0 && !msg_from_2 {
-        //         let mut result = rx.recv().await;
-        //         assert!(result.is_some());
-        //         let PushInfo { kind, data } = result.unwrap();
-
-        //         assert!(kind == PushKind::Disconnection || kind == PushKind::Subscribe || kind == PushKind::Message);
-        //         if kind == PushKind::Disconnection || kind == PushKind::Subscribe {
-        //             // ignore
-        //             continue;
-        //         }
-
-        //         if data == vec![
-        //             Value::BulkString("test_channel".into()),
-        //             Value::BulkString("test_message_from_node_0".into())] {
-        //             assert!(!msg_from_0);
-        //             msg_from_0 = true;
-        //         }
-        //         else if data == vec![
-        //             Value::BulkString("test_channel".into()),
-        //             Value::BulkString("test_message_from_node_2".into())] {
-        //             assert!(!msg_from_2);
-        //             msg_from_2 = true;
-        //         }
-        //         else {
-        //             assert!(false, "Unexpected message received");
-        //         }
-        //     }
-
-        //     Ok(())
-        // })
-        // .unwrap();
+            Ok(())
+        })
+        .unwrap();
     }
 
-    //#[allow(unreachable_code)]
+    #[test]
+    fn test_async_cluster_restore_resp3_pubsub_state_after_scale_out() {
+        let redis_ver = std::env::var("REDIS_VERSION").unwrap_or_default();
+        let use_sharded = redis_ver.starts_with("7.");
+
+        let mut client_subscriptions = PubSubSubscriptionInfo::from([
+            // test_channel_? is used as it maps to 14212 slot, which is the last node in both 3 and 6 node config
+            // (assuming slots allocation is monotonicaly increasing starting from node 0)
+            (
+                PubSubSubscriptionKind::Exact,
+                HashSet::from([PubSubChannelOrPattern::from("test_channel_?".as_bytes())]),
+            ),
+        ]);
+
+        if use_sharded {
+            client_subscriptions.insert(
+                PubSubSubscriptionKind::Sharded,
+                HashSet::from([PubSubChannelOrPattern::from("test_channel_?".as_bytes())]),
+            );
+        }
+
+        let slot_14212 = get_slot(b"test_channel_?");
+        assert_eq!(slot_14212, 14212);
+
+        let cluster = TestClusterContext::new_with_cluster_client_builder(
+            3,
+            0,
+            |builder| {
+                builder
+            .retries(3)
+            .use_protocol(ProtocolVersion::RESP3)
+            .pubsub_subscriptions(client_subscriptions.clone())
+            // periodic connection check is required to detect the disconnect from the last node
+            .periodic_connections_checks(Duration::from_secs(1))
+            // periodic topology check is required to detect topology change
+            .periodic_topology_checks(Duration::from_secs(1))
+            .slots_refresh_rate_limit(Duration::from_secs(0), 0)
+            },
+            false,
+        );
+
+        block_on_all(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PushInfo>();
+            let mut _listening_con = cluster.async_connection(Some(tx.clone())).await;
+            // Note, publishing connection has the same pubsub config
+            let mut publishing_con = cluster.async_connection(None).await;
+
+            // short sleep to allow the server to push subscription notification
+            sleep(futures_time::time::Duration::from_secs(1)).await;
+
+            // validate subscriptions
+            validate_subscriptions(&client_subscriptions, &mut rx, false);
+
+            // validate PUBLISH
+            let result = cmd("PUBLISH")
+                .arg("test_channel_?")
+                .arg("test_message")
+                .query_async(&mut publishing_con)
+                .await;
+            assert_eq!(
+                result,
+                Ok(Value::Int(2)) // 2 connections with the same pubsub config
+            );
+
+            sleep(futures_time::time::Duration::from_secs(1)).await;
+            let result = rx.try_recv();
+            assert!(result.is_ok());
+            let PushInfo { kind, data } = result.unwrap();
+            assert_eq!(
+                (kind, data),
+                (
+                    PushKind::Message,
+                    vec![
+                        Value::BulkString("test_channel_?".into()),
+                        Value::BulkString("test_message".into()),
+                    ]
+                )
+            );
+
+            if use_sharded {
+                // validate SPUBLISH
+                let result = cmd("SPUBLISH")
+                    .arg("test_channel_?")
+                    .arg("test_message")
+                    .query_async(&mut publishing_con)
+                    .await;
+                assert_eq!(
+                    result,
+                    Ok(Value::Int(2)) // 2 connections with the same pubsub config
+                );
+
+                sleep(futures_time::time::Duration::from_secs(1)).await;
+                let result = rx.try_recv();
+                assert!(result.is_ok());
+                let PushInfo { kind, data } = result.unwrap();
+                assert_eq!(
+                    (kind, data),
+                    (
+                        PushKind::SMessage,
+                        vec![
+                            Value::BulkString("test_channel_?".into()),
+                            Value::BulkString("test_message".into()),
+                        ]
+                    )
+                );
+            }
+
+            // drop and recreate a cluster with more nodes
+            drop(cluster);
+
+            // recreate the cluster, the assumtion is that the cluster is built with exactly the same params (ports, slots map...)
+            let cluster =
+                TestClusterContext::new_with_cluster_client_builder(6, 0, |builder| builder, false);
+
+            // assume slot 14212 will reside in the last node
+            let last_server_port = {
+                let addr = cluster.cluster.servers.last().unwrap().addr.clone();
+                match addr {
+                    redis::ConnectionAddr::TcpTls {
+                        host: _,
+                        port,
+                        insecure: _,
+                        tls_params: _,
+                    } => port,
+                    redis::ConnectionAddr::Tcp(_, port) => port,
+                    _ => {
+                        panic!("Wrong server address type: {:?}", addr);
+                    }
+                }
+            };
+
+            // wait for new topology discovery
+            loop {
+                let mut cmd = redis::cmd("INFO");
+                cmd.arg("SERVER");
+                let res = publishing_con
+                    .route_command(
+                        &cmd,
+                        RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(Route::new(
+                            slot_14212,
+                            SlotAddr::Master,
+                        ))),
+                    )
+                    .await;
+                assert!(res.is_ok());
+                let res = res.unwrap();
+                match res {
+                    Value::VerbatimString { format: _, text } => {
+                        if text.contains(format!("tcp_port:{}", last_server_port).as_str()) {
+                            // new topology rediscovered
+                            break;
+                        }
+                    }
+                    _ => {
+                        panic!("Wrong return type for INFO SERVER command: {:?}", res);
+                    }
+                }
+                sleep(futures_time::time::Duration::from_secs(1)).await;
+            }
+
+            // sleep for one one cycle of topology refresh
+            sleep(futures_time::time::Duration::from_secs(1)).await;
+
+            // validate PUBLISH
+            let result = redis::cmd("PUBLISH")
+                .arg("test_channel_?")
+                .arg("test_message")
+                .query_async(&mut publishing_con)
+                .await;
+            assert_eq!(
+                result,
+                Ok(Value::Int(2)) // 2 connections with the same pubsub config
+            );
+
+            // allow message to propagate
+            sleep(futures_time::time::Duration::from_secs(1)).await;
+
+            loop {
+                let result = rx.try_recv();
+                assert!(result.is_ok());
+                let PushInfo { kind, data } = result.unwrap();
+                // ignore disconnection and subscription notifications due to resubscriptions
+                if kind == PushKind::Message {
+                    assert_eq!(
+                        data,
+                        vec![
+                            Value::BulkString("test_channel_?".into()),
+                            Value::BulkString("test_message".into()),
+                        ]
+                    );
+                    break;
+                }
+            }
+
+            if use_sharded {
+                // validate SPUBLISH
+                let result = cmd("SPUBLISH")
+                    .arg("test_channel_?")
+                    .arg("test_message")
+                    .query_async(&mut publishing_con)
+                    .await;
+                assert_eq!(
+                    result,
+                    Ok(Value::Int(2)) // 2 connections with the same pubsub config
+                );
+
+                // allow message to propagate
+                sleep(futures_time::time::Duration::from_secs(1)).await;
+
+                let result = rx.try_recv();
+                assert!(result.is_ok());
+                let PushInfo { kind, data } = result.unwrap();
+                assert_eq!(
+                    (kind, data),
+                    (
+                        PushKind::SMessage,
+                        vec![
+                            Value::BulkString("test_channel_?".into()),
+                            Value::BulkString("test_message".into()),
+                        ]
+                    )
+                );
+            }
+
+            drop(publishing_con);
+            drop(_listening_con);
+
+            Ok(())
+        })
+        .unwrap();
+
+        block_on_all(async move {
+            sleep(futures_time::time::Duration::from_secs(10)).await;
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[test]
     fn test_async_cluster_resp3_pubsub() {
         let redis_ver = std::env::var("REDIS_VERSION").unwrap_or_default();
@@ -3268,39 +3302,10 @@ mod cluster_async {
             // short sleep to allow the server to push subscription notification
             sleep(futures_time::time::Duration::from_secs(1)).await;
 
-            let mut subscribe_cnt = client_subscriptions[&PubSubSubscriptionKind::Exact].len();
-            let mut psubscribe_cnt = client_subscriptions[&PubSubSubscriptionKind::Pattern].len();
-            let mut ssubscribe_cnt = 0;
-            if let Some(sharded_shubs) = client_subscriptions.get(&PubSubSubscriptionKind::Sharded)
-            {
-                ssubscribe_cnt += sharded_shubs.len()
-            }
-            for _ in 0..(subscribe_cnt + psubscribe_cnt + ssubscribe_cnt) {
-                let result = rx.try_recv();
-                assert!(result.is_ok());
-                let PushInfo { kind, data: _ } = result.unwrap();
-                assert!(
-                    kind == PushKind::Subscribe
-                        || kind == PushKind::PSubscribe
-                        || kind == PushKind::SSubscribe
-                );
-                if kind == PushKind::Subscribe {
-                    subscribe_cnt -= 1;
-                } else if kind == PushKind::PSubscribe {
-                    psubscribe_cnt -= 1;
-                } else {
-                    ssubscribe_cnt -= 1;
-                }
-            }
-
-            assert!(subscribe_cnt == 0);
-            assert!(psubscribe_cnt == 0);
-            assert!(ssubscribe_cnt == 0);
+            validate_subscriptions(&client_subscriptions, &mut rx, false);
 
             let slot_14212 = get_slot(b"test_channel_?");
             assert_eq!(slot_14212, 14212);
-            //let slot_14212_route = redis::cluster_routing::Route::new(slot_14212, redis::cluster_routing::SlotAddr::Master);
-            //let node_5_route = redis::cluster_routing::SingleNodeRoutingInfo::SpecificNode(slot_14212_route);
 
             let slot_0_route =
                 redis::cluster_routing::Route::new(0, redis::cluster_routing::SlotAddr::Master);

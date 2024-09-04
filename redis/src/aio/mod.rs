@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// Enables the async_std compatibility
 #[cfg(feature = "async-std-comp")]
@@ -85,6 +86,28 @@ pub trait ConnectionLike {
     /// also might be incorrect if the connection like object is not
     /// actually connected.
     fn get_db(&self) -> i64;
+
+    /// Returns the state of the connection
+    fn is_closed(&self) -> bool;
+}
+
+/// Implements ability to notify about disconnection events
+#[async_trait]
+pub trait DisconnectNotifier: Send + Sync {
+    /// Notify about disconnect event
+    fn notify_disconnect(&mut self);
+
+    /// Wait for disconnect event with timeout
+    async fn wait_for_disconnect_with_timeout(&self, max_wait: &Duration);
+
+    /// Intended to be used with Box
+    fn clone_box(&self) -> Box<dyn DisconnectNotifier>;
+}
+
+impl Clone for Box<dyn DisconnectNotifier> {
+    fn clone(&self) -> Box<dyn DisconnectNotifier> {
+        self.clone_box()
+    }
 }
 
 // Initial setup for every connection.

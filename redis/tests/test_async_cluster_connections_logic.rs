@@ -5,7 +5,7 @@ mod support;
 use redis::{
     cluster_async::testing::{AsyncClusterNode, RefreshConnectionType},
     testing::ClusterParams,
-    ErrorKind,
+    ErrorKind, GlideConnectionOptions,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -72,7 +72,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::AllConnections,
             None,
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let node = assert_full_success(result);
@@ -108,7 +108,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::AllConnections,
             None,
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let (node, _) = assert_partial_result(result);
@@ -126,7 +126,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::AllConnections,
             None,
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let (node, _) = assert_partial_result(result);
@@ -159,7 +159,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::AllConnections,
             None,
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let node = assert_full_success(result);
@@ -196,7 +196,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::AllConnections,
             None,
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let err = result.get_error().unwrap();
@@ -247,7 +247,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::OnlyManagementConnection,
             Some(node),
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let node = assert_full_success(result);
@@ -294,7 +294,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::OnlyManagementConnection,
             Some(node),
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let (node, _) = assert_partial_result(result);
@@ -356,7 +356,7 @@ mod test_connect_and_check {
             None,
             RefreshConnectionType::OnlyUserConnection,
             Some(node),
-            None,
+            GlideConnectionOptions::default(),
         )
         .await;
         let node = assert_full_success(result);

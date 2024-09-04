@@ -9,7 +9,8 @@ mod basic_async {
     use futures::{prelude::*, StreamExt};
     use redis::{
         aio::{ConnectionLike, MultiplexedConnection},
-        cmd, pipe, AsyncCommands, ErrorKind, PushInfo, PushKind, RedisResult, Value,
+        cmd, pipe, AsyncCommands, ErrorKind, GlideConnectionOptions, PushInfo, PushKind,
+        RedisResult, Value,
     };
     use tokio::sync::mpsc::error::TryRecvError;
 
@@ -100,7 +101,7 @@ mod basic_async {
     fn dont_panic_on_closed_multiplexed_connection() {
         let ctx = TestContext::new();
         let client = ctx.client.clone();
-        let connect = client.get_multiplexed_async_connection(None);
+        let connect = client.get_multiplexed_async_connection(GlideConnectionOptions::default());
         drop(ctx);
 
         block_on_all(async move {
@@ -584,7 +585,7 @@ mod basic_async {
         let client = redis::Client::open(coninfo).unwrap();
 
         let err = client
-            .get_multiplexed_tokio_connection(None)
+            .get_multiplexed_tokio_connection(GlideConnectionOptions::default())
             .await
             .err()
             .unwrap();
@@ -916,7 +917,10 @@ mod basic_async {
         let millisecond = std::time::Duration::from_millis(1);
         let mut retries = 0;
         loop {
-            match client.get_multiplexed_async_connection(None).await {
+            match client
+                .get_multiplexed_async_connection(GlideConnectionOptions::default())
+                .await
+            {
                 Err(err) => {
                     if err.is_connection_refusal() {
                         tokio::time::sleep(millisecond).await;
@@ -986,7 +990,8 @@ mod basic_async {
             let client =
                 build_single_client(ctx.server.connection_info(), &ctx.server.tls_paths, true)
                     .unwrap();
-            let connect = client.get_multiplexed_async_connection(None);
+            let connect =
+                client.get_multiplexed_async_connection(GlideConnectionOptions::default());
             block_on_all(connect.and_then(|mut con| async move {
                 redis::cmd("SET")
                     .arg("key1")
@@ -1007,7 +1012,8 @@ mod basic_async {
             let client =
                 build_single_client(ctx.server.connection_info(), &ctx.server.tls_paths, false)
                     .unwrap();
-            let connect = client.get_multiplexed_async_connection(None);
+            let connect =
+                client.get_multiplexed_async_connection(GlideConnectionOptions::default());
             let result = block_on_all(connect.and_then(|mut con| async move {
                 redis::cmd("SET")
                     .arg("key1")

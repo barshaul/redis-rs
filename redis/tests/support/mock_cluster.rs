@@ -1,6 +1,6 @@
 use redis::{
     cluster::{self, ClusterClient, ClusterClientBuilder},
-    ErrorKind, FromRedisValue, PushInfo, RedisError,
+    ErrorKind, FromRedisValue, GlideConnectionOptions, RedisError,
 };
 
 use std::{
@@ -17,8 +17,6 @@ use {
     once_cell::sync::Lazy,
     redis::{IntoConnectionInfo, RedisResult, Value},
 };
-
-use tokio::sync::mpsc;
 
 #[cfg(feature = "cluster-async")]
 use redis::{aio, cluster_async, RedisFuture};
@@ -134,7 +132,7 @@ impl cluster_async::Connect for MockConnection {
         _response_timeout: Duration,
         _connection_timeout: Duration,
         _socket_addr: Option<SocketAddr>,
-        _push_sender: Option<mpsc::UnboundedSender<PushInfo>>,
+        _glide_connection_options: GlideConnectionOptions,
     ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
     where
         T: IntoConnectionInfo + Send + 'a,
@@ -368,6 +366,10 @@ impl aio::ConnectionLike for MockConnection {
 
     fn get_db(&self) -> i64 {
         0
+    }
+
+    fn is_closed(&self) -> bool {
+        false
     }
 }
 
