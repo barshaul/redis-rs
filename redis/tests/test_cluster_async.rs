@@ -1318,6 +1318,80 @@ mod cluster_async {
     }
 
     #[test]
+    fn test_async_cluster_update_slots_based_on_moved_error() {
+        let name = "test_async_cluster_update_slots_based_on_moved_error";
+
+        let should_refresh = atomic::AtomicBool::new(false);
+
+        let MockEnv {
+            runtime,
+            async_connection: mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])                
+            // Enable the rate limiter with high value so it won't refresh the slots 
+            .slots_refresh_rate_limit(Duration::from_secs(1000000), 0),
+            name,
+            move |cmd: &[u8], port| {
+                if contains_slice(cmd, b"PING") || contains_slice(cmd, b"SETNAME") {
+                    return Err(Ok(Value::SimpleString("OK".into())));
+                }
+
+                if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                    return Err(Ok(Value::Array(vec![
+                        Value::Array(vec![
+                            Value::Int(0),
+                            Value::Int(16382),
+                            Value::Array(vec![
+                                Value::BulkString(name.as_bytes().to_vec()),
+                                Value::Int(6379),
+                            ]),
+                        ]),
+                        Value::Array(vec![
+                            Value::Int(16382),
+                            Value::Int(16383),
+                            Value::Array(vec![
+                                Value::BulkString(name.as_bytes().to_vec()),
+                                Value::Int(6380),
+                            ]),
+                        ]),
+                    ])));
+                }
+
+                if contains_slice(cmd, b"GET") {
+                    let get_response = Err(Ok(Value::BulkString(b"123".to_vec())));
+                    match port {
+                        6380 => {
+                            println!("received request {:?}", std::str::from_utf8(cmd));
+                            get_response
+                        }
+                        // Respond that the key exists on a node that does not yet have a connection:
+                        _ => {
+                            println!("hereee");
+                            // Should not attempt to refresh slots more than once:
+                            assert!(!should_refresh.swap(true, Ordering::SeqCst));
+                            Err(parse_redis_value(
+                                format!("-MOVED 123 {name}:6380\r\n").as_bytes(),
+                            ))
+                        }
+                    }
+                } else {
+                    panic!("unexpected command {cmd:?}")
+                }
+            },
+        );
+
+        let value = runtime.block_on(
+            cmd("GET")
+                .arg("test")
+                .query_async::<_, Option<i32>>(&mut connection),
+        );
+
+        assert_eq!(value, Ok(Some(123)));
+    }
+
+    #[test]
     fn test_async_cluster_reconnect_even_with_zero_retries() {
         let name = "test_async_cluster_reconnect_even_with_zero_retries";
 

@@ -629,9 +629,9 @@ impl From<String> for OperationTarget {
 #[derive(Clone, Debug)]
 pub(crate) struct RedirectNode {
     /// The address of the redirect node.
-    pub _address: String,
+    pub address: String,
     /// The slot of the redirect node.
-    pub _slot: u16,
+    pub slot: u16,
 }
 
 impl RedirectNode {
@@ -640,8 +640,8 @@ impl RedirectNode {
     /// the function converts the address to a `String` and constructs a `RedirectNode`.
     pub(crate) fn from_option_tuple(option: Option<(&str, u16)>) -> Option<Self> {
         option.map(|(address, slot)| RedirectNode {
-            _address: address.to_string(),
-            _slot: slot,
+            address: address.to_string(),
+            slot,
         })
     }
 }
@@ -757,6 +757,10 @@ pin_project! {
             #[pin]
             sleep: BoxFuture<'static, ()>,
         },
+        UpdateMoved {
+            #[pin]
+            future: BoxFuture<'static, RedisResult<()>>,
+        },
     }
 }
 
@@ -819,8 +823,27 @@ impl<C> Future for Request<C> {
                 }
                 .into();
             }
+            RequestStateProj::UpdateMoved { future } => {
+                println!("poll is found for UpdatedMoved, starting to poll it");
+                if let Err(err) = ready!(future.poll(cx)) {
+                    warn!(
+                        "Failed to update the slot map based on the recieved moved error.\n
+                    Error: {err:?}"
+                    );
+                }
+                println!("updaing the slot map finished");
+                if let Some(request) = self.project().request.take() {
+                    println!("request is Some, moving to retry");
+                    return Next::Retry { request }.into();
+                } else {
+                    println!("request is None, not retrying");
+                    return Next::Done.into();
+                }
+            }
             _ => panic!("Request future must be Some"),
         };
+        println!("polling request");
+
         match ready!(future.poll(cx)) {
             Ok(item) => {
                 self.respond(Ok(item));
@@ -835,6 +858,7 @@ impl<C> Future for Request<C> {
                     } else if matches!(err.retry_method(), crate::types::RetryMethod::MovedRedirect)
                         || matches!(target, OperationTarget::NotFound)
                     {
+                        println!("recieved moved = {:?}", err.redirect_node());
                         Next::RefreshSlots {
                             request: None,
                             sleep_duration: None,
@@ -1683,6 +1707,107 @@ where
         Ok(())
     }
 
+    /// Handles MOVED errors by updating the client's slot and node mappings based on the new primary's role:
+    /// 1. **No Change**: If the new primary is already the slot owner.
+    /// 2. **Failover**: If moved to a replica within the same shard, suggesting a failover has occurred.
+    /// 3. **Slot Migration**: Indicates a potential ongoing migration if moved to a primary in another shard.
+    /// 4. **Moved to an Existing Replica in a Different Shard**:
+    ///    - The replica became the primary of its shard after a failover, with new slots migrated to it.
+    ///    - The replica has moved to a different shard as the primary.
+    ///      Information about the new shard—whether it’s the original shard or a new one
+    ///      with different slots and nodes—is unknown.
+    /// 5. **New Node**: If moved to an unknown node, this suggests the addition of a new node and possible scale-out.
+    ///
+    /// # Arguments
+    /// * `inner` - Shared reference to InnerCore containing connection and slot state.
+    /// * `slot` - The slot number reported as moved.
+    /// * `new_primary` - The address of the node now responsible for the slot.
+    ///
+    /// # Returns
+    /// * `RedisResult<()>` indicating success or failure in updating slot mappings.
+    async fn update_upon_moved_error(
+        inner: Arc<InnerCore<C>>,
+        slot: u16,
+        new_primary: Arc<String>,
+    ) -> RedisResult<()> {
+        let connections_container = inner.conn_lock.read().await;
+        let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
+        println!("before={}", connections_container.slot_map);
+
+        // Check if the new primary is already a part of the current shard nodes
+        if let Some(curr_shard_addrs) = curr_shard_addrs {
+            let curr_shard_addrs_read = curr_shard_addrs
+                .read()
+                .expect("Failed to acquire read lock for ShardAddrs");
+            if *curr_shard_addrs_read.primary() == *new_primary {
+                println!("Scenario 1");
+                // Scenario 1: No change needed if the new primary is already recognized as the slot owner.
+                return Ok(());
+            }
+
+            if curr_shard_addrs_read.replicas().contains(&new_primary) {
+                // Scenario 2: Handle failover within the same shard by updating all slots managed by the old primary to the new primary.
+                println!("Scenario 2");
+                drop(curr_shard_addrs_read);
+                let mut curr_shard_addrs_write = curr_shard_addrs
+                    .write()
+                    .expect("Failed to acquire write lock for ShardAddrs");
+                return curr_shard_addrs_write.promote_replica_to_primary(new_primary);
+            }
+        }
+        // Scenario 3 and 4: Check if the node exists in other shards
+        let mut nodes_iter = connections_container.slot_map_nodes();
+        for (node_addr, shard_addrs_arc) in &mut nodes_iter {
+            if node_addr == new_primary {
+                let is_existing_primary;
+                {
+                    let shard_addrs = shard_addrs_arc
+                        .read()
+                        .expect("Failed to acquire read lock for ShardAddrs");
+                    is_existing_primary = *shard_addrs.primary() == *new_primary;
+                }
+                if is_existing_primary {
+                    // Scenario 3: Slot migration to an existing primary in another shard.
+                    // Update the associated addresses for `slot` to `shard_addrs`.
+                    println!("Scenario 3");
+                    drop(nodes_iter);
+                    drop(connections_container);
+                    let mut connections_container = inner.conn_lock.write().await;
+                    return connections_container
+                        .slot_map
+                        .update_slot_range(slot, shard_addrs_arc.clone());
+                } else {
+                    println!("Scenario 4");
+                    // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn’t own `slot`.
+                    // Remove the replica from its existing shard and treat it as a new node in a new shard.
+                    {
+                        let mut prev_shard_addrs = shard_addrs_arc
+                            .write()
+                            .expect("Failed to acquire write lock for ShardAddrs");
+                        if let Err(err) = prev_shard_addrs.remove_replica(new_primary.clone()) {
+                            warn!("Failed to remove node {new_primary:?} from previous shard: {prev_shard_addrs:?}.\nError: {err:?}");
+                        }
+                    }
+                    drop(nodes_iter);
+                    drop(connections_container);
+                    let mut connections_container = inner.conn_lock.write().await;
+                    return connections_container
+                        .slot_map
+                        .add_new_primary(slot, new_primary);
+                }
+            }
+        }
+
+        // Scenario 5: `new_primary` isn’t present in the current slots map. Add it as a new node in a new shard.
+        println!("Scenario 5");
+        drop(nodes_iter);
+        drop(connections_container);
+        let mut connections_container = inner.conn_lock.write().await;
+        connections_container
+            .slot_map
+            .add_new_primary(slot, new_primary)
+    }
+
     async fn execute_on_multiple_nodes<'a>(
         cmd: &'a Arc<Cmd>,
         routing: &'a MultipleNodeRoutingInfo,
@@ -1813,6 +1938,7 @@ where
         let (address, mut conn) = Self::get_connection(routing, core, Some(cmd.clone()))
             .await
             .map_err(|err| (OperationTarget::NotFound, err))?;
+        println!("recieved connection for {address:?}");
         conn.req_packed_command(&cmd)
             .await
             .map(Response::Single)
@@ -2104,25 +2230,40 @@ where
                     sleep_duration,
                     moved_redirect,
                 } => {
-                    poll_flush_action = poll_flush_action
-                        .change_state(PollFlushAction::RebuildSlots(moved_redirect));
-                    if let Some(request) = request {
-                        let future: RequestState<
-                            Pin<Box<dyn Future<Output = OperationResult> + Send>>,
-                        > = match sleep_duration {
-                            Some(sleep_duration) => RequestState::Sleep {
+                    poll_flush_action =
+                        poll_flush_action.change_state(PollFlushAction::RebuildSlots);
+                    let future: Option<
+                        RequestState<Pin<Box<dyn Future<Output = OperationResult> + Send>>>,
+                    > = if let Some(moved_redirect) = moved_redirect {
+                        println!(
+                            "moved_redirect is found, adding future to update_upon_moved_error"
+                        );
+                        Some(RequestState::UpdateMoved {
+                            future: Box::pin(ClusterConnInner::update_upon_moved_error(
+                                self.inner.clone(),
+                                moved_redirect.slot,
+                                moved_redirect.address.into(),
+                            )),
+                        })
+                    } else if let Some(ref request) = request {
+                        match sleep_duration {
+                            Some(sleep_duration) => Some(RequestState::Sleep {
                                 sleep: boxed_sleep(sleep_duration),
-                            },
-                            None => RequestState::Future {
+                            }),
+                            None => Some(RequestState::Future {
                                 future: Box::pin(Self::try_request(
                                     request.info.clone(),
                                     self.inner.clone(),
                                 )),
-                            },
-                        };
+                            }),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(future) = future {
                         self.in_flight_requests.push(Box::pin(Request {
                             retry_params: self.inner.cluster_params.retry_params.clone(),
-                            request: Some(request),
+                            request,
                             future,
                         }));
                     }
@@ -2175,7 +2316,7 @@ where
 
 enum PollFlushAction {
     None,
-    RebuildSlots(Option<RedirectNode>),
+    RebuildSlots,
     Reconnect(Vec<String>),
     ReconnectFromInitialConnections,
 }
@@ -2190,9 +2331,8 @@ impl PollFlushAction {
                 PollFlushAction::ReconnectFromInitialConnections
             }
 
-            (PollFlushAction::RebuildSlots(moved_redirect), _)
-            | (_, PollFlushAction::RebuildSlots(moved_redirect)) => {
-                PollFlushAction::RebuildSlots(moved_redirect)
+            (PollFlushAction::RebuildSlots, _) | (_, PollFlushAction::RebuildSlots) => {
+                PollFlushAction::RebuildSlots
             }
 
             (PollFlushAction::Reconnect(mut addrs), PollFlushAction::Reconnect(new_addrs)) => {
@@ -2253,8 +2393,7 @@ where
 
             match ready!(self.poll_complete(cx)) {
                 PollFlushAction::None => return Poll::Ready(Ok(())),
-                PollFlushAction::RebuildSlots(_moved_redirect) => {
-                    // TODO: Add logic to update the slots map based on the MOVED error
+                PollFlushAction::RebuildSlots => {
                     self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
                         ClusterConnInner::refresh_slots_and_subscriptions_with_retries(
                             self.inner.clone(),

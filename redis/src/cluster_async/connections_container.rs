@@ -1,11 +1,13 @@
 use crate::cluster_async::ConnectionFuture;
-use crate::cluster_routing::{Route, SlotAddr};
+use crate::cluster_routing::{Route, ShardAddrs, SlotAddr};
 use crate::cluster_slotmap::{ReadFromReplicaStrategy, SlotMap, SlotMapValue};
 use crate::cluster_topology::TopologyHash;
 use dashmap::DashMap;
 use futures::FutureExt;
 use rand::seq::IteratorRandom;
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::RwLock;
 
 /// A struct that encapsulates a network connection along with its associated IP address.
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -135,6 +137,16 @@ where
             read_from_replica_strategy,
             topology_hash,
         }
+    }
+
+    /// Returns an iterator over the nodes in the `slot_map`, yielding pairs of the node address and its associated shard addresses.
+    pub(crate) fn slot_map_nodes(
+        &self,
+    ) -> impl Iterator<Item = (Arc<String>, Arc<RwLock<ShardAddrs>>)> + '_ {
+        self.slot_map
+            .nodes_map()
+            .iter()
+            .map(|item| (item.key().clone(), item.value().clone()))
     }
 
     // Extends the current connection map with the provided one

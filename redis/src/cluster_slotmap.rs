@@ -9,14 +9,16 @@ use std::{
 use dashmap::DashMap;
 
 use crate::cluster_routing::{Route, ShardAddrs, Slot, SlotAddr};
-
+use crate::ErrorKind;
+use crate::RedisError;
+use crate::RedisResult;
 pub(crate) type NodesMap = DashMap<Arc<String>, Arc<RwLock<ShardAddrs>>>;
 
 #[derive(Debug)]
 pub(crate) struct SlotMapValue {
     pub(crate) start: u16,
     pub(crate) addrs: Arc<RwLock<ShardAddrs>>,
-    pub(crate) last_used_replica: AtomicUsize,
+    pub(crate) last_used_replica: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Copy)]
@@ -70,6 +72,7 @@ impl SlotMap {
         let mut slot_map = SlotMap::new_with_read_strategy(read_from_replica);
         let mut shard_id = 0;
         for slot in slots {
+            println!("slot={slot:?}");
             let primary = Arc::new(slot.master);
             // Get the shard addresses if the primary is already in nodes_map;
             // otherwise, create a new ShardAddrs and add it
@@ -101,11 +104,11 @@ impl SlotMap {
                 SlotMapValue {
                     addrs: shard_addrs_arc.clone(),
                     start: slot.start,
-                    last_used_replica: AtomicUsize::new(0),
+                    last_used_replica: Arc::new(AtomicUsize::new(0)),
                 },
             );
         }
-
+        println!("new slot map= {slot_map:?}");
         slot_map
     }
 
@@ -141,6 +144,15 @@ impl SlotMap {
         self.slot_value_for_route(route).map(|slot_value| {
             get_address_from_slot(slot_value, self.read_from_replica, route.slot_addr())
         })
+    }
+
+    /// Retrieves the shard addresses (`ShardAddrs`) for the specified `slot` by looking it up in the `slots` tree,
+    /// returning a reference to the stored shard addresses if found.
+    pub(crate) fn shard_addrs_for_slot(&self, slot: u16) -> Option<Arc<RwLock<ShardAddrs>>> {
+        self.slots
+            .range(slot..)
+            .next()
+            .map(|(_, slot_value)| slot_value.addrs.clone())
     }
 
     pub fn addresses_for_all_primaries(&self) -> HashSet<Arc<String>> {
@@ -216,6 +228,228 @@ impl SlotMap {
                 None
             }
         })
+    }
+
+    /// Inserts a single slot into the `slots` map, associating it with a new `SlotMapValue`
+    /// that contains the shard addresses (`shard_addrs`) and represents a range of just the given slot.
+    fn add_single_slot(&mut self, slot: u16, shard_addrs: Arc<RwLock<ShardAddrs>>) {
+        self.slots.insert(
+            slot,
+            SlotMapValue {
+                start: slot,
+                addrs: shard_addrs,
+                last_used_replica: Arc::new(AtomicUsize::new(0)),
+            },
+        );
+    }
+
+    /// Replaces the shard addresses in `current_addrs` with `new_addrs`.
+    fn replace_shard_addrs(current_addrs: &Arc<RwLock<ShardAddrs>>, new_addrs: ShardAddrs) {
+        let mut write_guard = current_addrs
+            .write()
+            .expect("Failed to acquire write lock for ShardAddrs");
+        *write_guard = new_addrs;
+    }
+
+    /// Creats a new shard addresses that contain only the primary node, adds it to the nodes map
+    /// and updates the slots tree for the given `slot` to point to the new primary.
+    pub(crate) fn add_new_primary(&mut self, slot: u16, node_addr: Arc<String>) -> RedisResult<()> {
+        let shard_addrs = Arc::new(RwLock::new(ShardAddrs::new_with_primary(node_addr.clone())));
+        self.nodes_map.insert(node_addr, shard_addrs.clone());
+        self.update_slot_range(slot, shard_addrs)
+    }
+
+    fn shard_addrs_equal(this: &Arc<RwLock<ShardAddrs>>, other: &Arc<RwLock<ShardAddrs>>) -> bool {
+        let read_this = this.read().unwrap();
+        let read_other = other.read().unwrap();
+        *read_this == *read_other
+    }
+
+    /// Updates the end of an existing slot range in the `slots` tree. This function removes the slot entry
+    /// associated with the current end (`curr_end`) and reinserts it with a new end value (`new_end`).
+    ///
+    /// The operation effectively shifts the range's end boundary from `curr_end` to `new_end`, while keeping the
+    /// rest of the slot's data (e.g., shard addresses) unchanged.
+    ///
+    /// # Parameters:
+    /// - `curr_end`: The current end of the slot range that will be removed.
+    /// - `new_end`: The new end of the slot range where the slot data will be reinserted.
+    fn update_end_range(&mut self, curr_end: u16, new_end: u16) -> RedisResult<()> {
+        if let Some(curr_slot_val) = self.slots.remove(&curr_end) {
+            self.slots.insert(new_end, curr_slot_val);
+            return Ok(());
+        }
+        Err(RedisError::from((
+            ErrorKind::ClientError,
+            "Couldn't find slot range with end: {curr_end:?} in the slot map",
+        )))
+    }
+
+    /// Attempts to merge the current `slot` with the next slot range in the `slots` map, if they are consecutive
+    /// and share the same shard addresses. If the next slot's starting position is exactly `slot + 1`
+    /// and the shard addresses match, the next slot's starting point is moved to `slot`, effectively merging
+    /// the slot to the existing range.
+    ///
+    /// # Parameters:
+    /// - `slot`: The slot to attempt to merge with the next slot.
+    /// - `new_addrs`: The shard addresses to compare with the next slot's shard addresses.
+    ///
+    /// # Returns:
+    /// - `bool`: Returns `true` if the merge was successful, otherwise `false`.
+    fn try_merge_to_next_range(&mut self, slot: u16, new_addrs: Arc<RwLock<ShardAddrs>>) -> bool {
+        if let Some((_next_end, next_slot_value)) = self.slots.range_mut((slot + 1)..).next() {
+            if next_slot_value.start == slot + 1
+                && Self::shard_addrs_equal(&next_slot_value.addrs, &new_addrs)
+            {
+                next_slot_value.start = slot;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Attempts to merge the current slot with the previous slot range in the `slots` map, if they are consecutive
+    /// and share the same shard addresses. If the previous slot ends at `slot - 1` and the shard addresses match,
+    /// the end of the previous slot is extended to `slot`, effectively merging the slot to the existing range.
+    ///
+    /// # Parameters:
+    /// - `slot`: The slot to attempt to merge with the previous slot.
+    /// - `new_addrs`: The shard addresses to compare with the previous slot's shard addresses.
+    ///
+    /// # Returns:
+    /// - `RedisResult<bool>`: Returns `Ok(true)` if the merge was successful, otherwise `Ok(false)`.
+    fn try_merge_to_prev_range(
+        &mut self,
+        slot: u16,
+        new_addrs: Arc<RwLock<ShardAddrs>>,
+    ) -> RedisResult<bool> {
+        if let Some((prev_end, prev_slot_value)) = self.slots.range_mut(..slot).next_back() {
+            if *prev_end == slot - 1 && Self::shard_addrs_equal(&prev_slot_value.addrs, &new_addrs)
+            {
+                let prev_end = *prev_end;
+                self.update_end_range(prev_end, slot)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Updates the slot range in the `BTreeMap` to point to new shard addresses.
+    ///
+    /// This function handles the following scenarios when updating the slot mapping:
+    ///
+    /// **Scenario 1 - Single Slot Range**:
+    ///    - If the slot is the only slot in the current range (i.e., `start == end == slot`),
+    ///      the function simply replaces the shard addresses for this slot without altering
+    ///      the structure of the `slots` tree.
+    ///
+    /// **Scenario 2 - Slot Matches the End of a Range**:
+    ///    - If the slot is the last slot in the current range (`slot == end`), the function
+    ///      adjusts the range by decrementing the end of the current range by 1 (making the
+    ///      new end equal to `end - 1`). The current slot is then removed and a new entry is
+    ///      inserted for the slot with the new shard addresses.
+    ///
+    /// **Scenario 3 - Slot Matches the Start of a Range**:
+    ///    - If the slot is the first slot in the current range (`slot == start`), the function
+    ///      increments the start of the current range by 1 (making the new start equal to
+    ///      `start + 1`). A new entry is then inserted for the slot with the new shard addresses.
+    ///
+    /// **Scenario 4 - Slot is Within a Range**:
+    ///    - If the slot falls between the start and end of a current range (`start < slot < end`),
+    ///      the function splits the current range into two. The range before the slot (`start` to
+    ///      `slot - 1`) remains with the old shard addresses, a new entry for the slot is added
+    ///      with the new shard addresses, and the range after the slot (`slot + 1` to `end`) is
+    ///      reinserted with the old shard addresses.
+    ///
+    /// **Scenario 5 - Slot is Not Covered**:
+    ///    - If the slot is not part of any existing range, a new entry is simply inserted into
+    ///      the `slots` tree with the new shard addresses.
+    ///
+    /// # Parameters:
+    /// - `slot`: The specific slot that needs to be updated.
+    /// - `new_addrs`: The new shard addresses to associate with the slot.
+    ///
+    /// # Returns:
+    /// - `RedisResult<()>`: Indicates the success or failure of the operation.
+    pub(crate) fn update_slot_range(
+        &mut self,
+        slot: u16,
+        new_addrs: Arc<RwLock<ShardAddrs>>,
+    ) -> RedisResult<()> {
+        let curr_tree_node =
+            self.slots
+                .range_mut(slot..)
+                .next()
+                .and_then(|(&end, slot_map_value)| {
+                    if slot >= slot_map_value.start && slot <= end {
+                        Some((end, slot_map_value))
+                    } else {
+                        None
+                    }
+                });
+
+        if let Some((curr_end, curr_slot_val)) = curr_tree_node {
+            if curr_slot_val.start == curr_end && curr_slot_val.start == slot {
+                // Scenario 1: The current tree node holds only this slot, we can simple replace
+                // the shard addresses in it
+                Self::replace_shard_addrs(
+                    &curr_slot_val.addrs,
+                    new_addrs
+                        .read()
+                        .expect("Failed to acquire read lock for ShardAddrs")
+                        .clone(),
+                );
+            } else if slot == curr_end {
+                // Scenario 2: Remove the existing tree node and insert it with the new end slot
+                self.update_end_range(curr_end, curr_end - 1)?;
+                // Insert the new slot
+                if !self.try_merge_to_next_range(slot, new_addrs.clone()) {
+                    self.add_single_slot(slot, new_addrs);
+                }
+            } else if slot == curr_slot_val.start {
+                // Scenario 3: Update the current start range
+                curr_slot_val.start += 1;
+                // Insert the new slot
+                if !self.try_merge_to_prev_range(slot, new_addrs.clone())? {
+                    self.add_single_slot(slot, new_addrs);
+                }
+            } else if slot > curr_slot_val.start && slot < curr_end {
+                // Scenario 4: The slot is within the range. We will split the current range into three parts:
+                // A: [start, slot - 1], which will remain owned by the current shard,
+                // B: [slot, slot], which will be owned by the new shard addresses,
+                // C: [slot + 1, end], which will remain owned by the current shard.
+
+                let start: u16 = curr_slot_val.start;
+                let addrs = curr_slot_val.addrs.clone();
+                let last_used_replica = curr_slot_val.last_used_replica.clone();
+
+                // Modify the current slot range to become part C: [slot + 1, end], still owned by the current shard.
+                curr_slot_val.start = slot + 1;
+
+                // Create and insert a new SlotMapValue representing part A: [start, slot - 1],
+                // still owned by the current shard, into the slot map.
+                self.slots.insert(
+                    slot - 1,
+                    SlotMapValue {
+                        start,
+                        addrs,
+                        last_used_replica,
+                    },
+                );
+
+                // Insert the new shard addresses into the slot map as part B: [slot, slot],
+                // which will be owned by the new shard addresses.
+                self.add_single_slot(slot, new_addrs);
+            }
+        } else {
+            // Scenario 5: The slot isn't covered, insert it
+            if !self.try_merge_to_prev_range(slot, new_addrs.clone())?
+                && !self.try_merge_to_next_range(slot, new_addrs.clone())
+            {
+                self.add_single_slot(slot, new_addrs);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -517,5 +751,122 @@ mod tests_cluster_slotmap {
             slot_map.get_slots_of_node(Arc::new("replica6:6379".to_string())),
             (2001..3001).collect::<Vec<u16>>()
         );
+    }
+
+    fn assert_equal_shard_addrs(this: Arc<RwLock<ShardAddrs>>, other: Arc<RwLock<ShardAddrs>>) {
+        let read_this = this.read().unwrap();
+        let read_other = other.read().unwrap();
+        assert_eq!(*read_this, *read_other);
+    }
+
+    fn assert_equal_slot_maps(this: SlotMap, expected: Vec<Slot>) {
+        for ((end, slot_value), expected_slot) in this.slots.iter().zip(expected.iter()) {
+            assert_eq!(*end, expected_slot.end);
+            assert_eq!(slot_value.start, expected_slot.start);
+            let shard_addrs = slot_value.addrs.read().unwrap();
+            assert_eq!(*shard_addrs.primary(), expected_slot.master);
+            let _ = shard_addrs
+                .replicas()
+                .iter()
+                .zip(expected_slot.replicas.iter())
+                .map(|(curr, expected)| {
+                    assert_eq!(**curr, *expected);
+                });
+        }
+    }
+
+    fn create_slot(start: u16, end: u16, master: &str, replicas: Vec<&str>) -> Slot {
+        Slot::new(
+            start,
+            end,
+            master.to_owned(),
+            replicas.into_iter().map(|r| r.to_owned()).collect(),
+        )
+    }
+
+    fn assert_slot_map_and_shard_addrs(
+        slot_map: SlotMap,
+        slot: u16,
+        new_shard_addrs: Arc<RwLock<ShardAddrs>>,
+        expected_slots: Vec<Slot>,
+    ) {
+        assert_equal_shard_addrs(
+            slot_map.shard_addrs_for_slot(slot).unwrap(),
+            new_shard_addrs,
+        );
+        assert_equal_slot_maps(slot_map, expected_slots);
+    }
+
+    #[test]
+    fn test_update_slot_range_single_slot_range() {
+        let before_slots = vec![
+            create_slot(1, 7999, "node1:6379", vec!["replica1:6379"]),
+            create_slot(8000, 8000, "node2:6379", vec!["replica2:6379"]),
+            create_slot(8001, 16383, "node3:6379", vec!["replica3:6379"]),
+        ];
+
+        let mut slot_map = SlotMap::new(before_slots, ReadFromReplicaStrategy::AlwaysFromPrimary);
+        let new_shard_addrs = slot_map
+            .shard_addrs_for_slot(8001)
+            .expect("Couldn't find shard address for slot 8001");
+
+        let res = slot_map.update_slot_range(8000, new_shard_addrs.clone());
+        assert!(res.is_ok(), "{res:?}");
+
+        let after_slots = vec![
+            create_slot(1, 7999, "node1:6379", vec!["replica1:6379"]),
+            create_slot(8000, 8000, "node3:6379", vec!["replica3:6379"]),
+            create_slot(8001, 16383, "node3:6379", vec!["replica3:6379"]),
+        ];
+
+        assert_slot_map_and_shard_addrs(slot_map, 8000, new_shard_addrs, after_slots);
+    }
+
+    #[test]
+    fn test_update_slot_range_slot_matches_end_range_merge_ranges() {
+        let before_slots = vec![
+            create_slot(1, 7999, "node1:6379", vec!["replica1:6379"]),
+            create_slot(8000, 16383, "node2:6379", vec!["replica2:6379"]),
+        ];
+
+        let mut slot_map = SlotMap::new(before_slots, ReadFromReplicaStrategy::AlwaysFromPrimary);
+        let new_shard_addrs = slot_map
+            .shard_addrs_for_slot(8000)
+            .expect("Couldn't find shard address for slot 8000");
+
+        let res = slot_map.update_slot_range(7999, new_shard_addrs.clone());
+        assert!(res.is_ok(), "{res:?}");
+
+        let after_slots = vec![
+            create_slot(1, 7998, "node1:6379", vec!["replica1:6379"]),
+            create_slot(7999, 16383, "node2:6379", vec!["replica2:6379"]),
+        ];
+
+        assert_slot_map_and_shard_addrs(slot_map, 7999, new_shard_addrs, after_slots);
+    }
+
+    #[test]
+    fn test_update_slot_range_slot_matches_end_range_new_shard_addrs() {
+        let before_slots = vec![
+            create_slot(1, 7999, "node1:6379", vec!["replica1:6379"]),
+            create_slot(8000, 16383, "node2:6379", vec!["replica2:6379"]),
+        ];
+
+        let mut slot_map = SlotMap::new(before_slots, ReadFromReplicaStrategy::AlwaysFromPrimary);
+        let new_shard_addrs = Arc::new(std::sync::RwLock::new(ShardAddrs::new(
+            Arc::new("node3:6379".to_owned()),
+            vec![Arc::new("replica3:6379".to_owned())],
+        )));
+
+        let res = slot_map.update_slot_range(7999, new_shard_addrs.clone());
+        assert!(res.is_ok(), "{res:?}");
+
+        let after_slots = vec![
+            create_slot(1, 7998, "node1:6379", vec!["replica1:6379"]),
+            create_slot(7999, 7999, "node3:6379", vec!["replica3:6379"]),
+            create_slot(8000, 16383, "node2:6379", vec!["replica2:6379"]),
+        ];
+
+        assert_slot_map_and_shard_addrs(slot_map, 7999, new_shard_addrs, after_slots);
     }
 }

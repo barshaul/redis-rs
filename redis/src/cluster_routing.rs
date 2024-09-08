@@ -1,7 +1,7 @@
 use crate::cluster_topology::get_slot;
 use crate::cmd::{Arg, Cmd};
 use crate::types::Value;
-use crate::{ErrorKind, RedisResult};
+use crate::{ErrorKind, RedisError, RedisResult};
 use std::cmp::min;
 use std::collections::HashMap;
 use std::iter::Once;
@@ -905,12 +905,67 @@ impl ShardAddrs {
         Self { primary, replicas }
     }
 
+    pub(crate) fn new_with_primary(primary: Arc<String>) -> Self {
+        Self::new(primary, Vec::new())
+    }
+
     pub(crate) fn primary(&self) -> Arc<String> {
         self.primary.clone()
     }
 
     pub(crate) fn replicas(&self) -> &Vec<Arc<String>> {
         self.replicas.as_ref()
+    }
+
+    /// Promotes the specified `replica` to the primary role if it exists among the shard's replicas.
+    /// This is used during a failover event when the primary node needs to be updated.
+    ///
+    /// # Arguments
+    /// * `replica` - The address of the replica to promote.
+    ///
+    /// # Returns
+    /// * `RedisResult<()>` - `Ok(())` if successful, or an error if the replica is not found.
+    pub(crate) fn promote_replica_to_primary(&mut self, replica: Arc<String>) -> RedisResult<()> {
+        for current_replica in self.replicas.iter_mut() {
+            if *current_replica == replica {
+                std::mem::swap(&mut self.primary, current_replica);
+                return Ok(());
+            }
+        }
+        Err(RedisError::from((
+            ErrorKind::ClientError,
+            "Failed to promote replica to primary",
+            format!("The specified replica: {replica:?} not found among replicas"),
+        )))
+    }
+
+    fn replica_index(&self, target_replica: Arc<String>) -> Option<usize> {
+        self.replicas
+            .iter()
+            .position(|curr_replica| **curr_replica == *target_replica)
+    }
+
+    /// Removes the specified `replica_to_remove` from the shard's replica list if it exists.
+    /// This method searches for the replica's index and removes it from the list. If the replica
+    /// is not found, it returns an error.
+    ///
+    /// # Arguments
+    /// * `replica_to_remove` - The address of the replica to be removed.
+    ///
+    /// # Returns
+    /// * `RedisResult<()>` - `Ok(())` if the replica was successfully removed, or an error if the
+    ///   replica was not found.
+    pub(crate) fn remove_replica(&mut self, replica_to_remove: Arc<String>) -> RedisResult<()> {
+        if let Some(index) = self.replica_index(replica_to_remove.clone()) {
+            self.replicas.remove(index);
+            Ok(())
+        } else {
+            Err(RedisError::from((
+                ErrorKind::ClientError,
+                "Couldn't remove replica",
+                format!("Replica {replica_to_remove:?} not found"),
+            )))
+        }
     }
 }
 
