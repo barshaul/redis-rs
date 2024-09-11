@@ -848,7 +848,7 @@ impl Routable for Value {
     }
 }
 
-#[derive(Debug, Hash)]
+#[derive(Debug, Hash, Clone)]
 pub(crate) struct Slot {
     pub(crate) start: u16,
     pub(crate) end: u16,
@@ -1004,10 +1004,11 @@ impl Route {
 mod tests {
     use super::{
         command_for_multi_slot_indices, AggregateOp, MultipleNodeRoutingInfo, ResponsePolicy,
-        Route, RoutingInfo, SingleNodeRoutingInfo, SlotAddr,
+        Route, RoutingInfo, ShardAddrs, SingleNodeRoutingInfo, SlotAddr,
     };
     use crate::{cluster_topology::slot, cmd, parser::parse_redis_value, Value};
     use core::panic;
+    use std::sync::Arc;
 
     #[test]
     fn test_routing_info_mixed_capatalization() {
@@ -1397,5 +1398,45 @@ mod tests {
         let input = vec![Value::Int(5)];
         let result = super::combine_map_results(input);
         assert!(result.is_err());
+    }
+
+    fn create_test_shard(primary: &str, replicas: Vec<&str>) -> ShardAddrs {
+        let primary = Arc::new(primary.to_string());
+        let replicas = replicas
+            .into_iter()
+            .map(|r| Arc::new(r.to_string()))
+            .collect();
+        ShardAddrs::new(primary, replicas)
+    }
+
+    #[test]
+    fn test_promote_replica_to_primary_success() {
+        let mut shard = create_test_shard("primary1", vec!["replica1", "replica2"]);
+
+        // Promote "replica1" to primary
+        let replica = Arc::new("replica1".to_string());
+        let result = shard.promote_replica_to_primary(replica.clone());
+
+        // Assert the promotion was successful
+        assert!(result.is_ok());
+        assert_eq!(*shard.primary(), "replica1");
+        assert_eq!(*shard.replicas()[0], "primary1");
+        assert_eq!(*shard.replicas()[1], "replica2");
+    }
+
+    #[test]
+    fn test_promote_replica_to_primary_not_found() {
+        let mut shard = create_test_shard("primary1", vec!["replica1", "replica2"]);
+
+        // Try to promote a replica that doesn't exist
+        let non_existent_replica = Arc::new("replica3".to_string());
+        let result = shard.promote_replica_to_primary(non_existent_replica.clone());
+
+        // Assert the promotion failed
+        assert!(result.is_err(), "{result:?}");
+        let error = result.err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("Failed to promote replica to primary"));
     }
 }

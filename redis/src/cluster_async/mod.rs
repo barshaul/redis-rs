@@ -824,25 +824,23 @@ impl<C> Future for Request<C> {
                 .into();
             }
             RequestStateProj::UpdateMoved { future } => {
-                println!("poll is found for UpdatedMoved, starting to poll it");
                 if let Err(err) = ready!(future.poll(cx)) {
+                    // Updating the slot map based on the MOVED error is an optimization.
+                    // If it fails, proceed by retrying the request with the redirected node,
+                    // and allow the slot refresh task to correct the slot map.
                     warn!(
-                        "Failed to update the slot map based on the recieved moved error.\n
-                    Error: {err:?}"
+                        "Failed to update the slot map based on the received MOVED error.\n
+                        Error: {err:?}"
                     );
                 }
-                println!("updaing the slot map finished");
                 if let Some(request) = self.project().request.take() {
-                    println!("request is Some, moving to retry");
                     return Next::Retry { request }.into();
                 } else {
-                    println!("request is None, not retrying");
                     return Next::Done.into();
                 }
             }
             _ => panic!("Request future must be Some"),
         };
-        println!("polling request");
 
         match ready!(future.poll(cx)) {
             Ok(item) => {
@@ -858,7 +856,6 @@ impl<C> Future for Request<C> {
                     } else if matches!(err.retry_method(), crate::types::RetryMethod::MovedRedirect)
                         || matches!(target, OperationTarget::NotFound)
                     {
-                        println!("recieved moved = {:?}", err.redirect_node());
                         Next::RefreshSlots {
                             request: None,
                             sleep_duration: None,
@@ -1708,15 +1705,19 @@ where
     }
 
     /// Handles MOVED errors by updating the client's slot and node mappings based on the new primary's role:
-    /// 1. **No Change**: If the new primary is already the slot owner.
-    /// 2. **Failover**: If moved to a replica within the same shard, suggesting a failover has occurred.
-    /// 3. **Slot Migration**: Indicates a potential ongoing migration if moved to a primary in another shard.
-    /// 4. **Moved to an Existing Replica in a Different Shard**:
+    /// /// Updates the slot and node mappings in response to a MOVED error.
+    /// This function handles various scenarios based on the new primary's role:
+    ///
+    /// 1. **No Change**: If the new primary is already the current slot owner, no updates are needed.
+    /// 2. **Failover**: If the new primary is a replica within the same shard (indicating a failover),
+    ///    the slot ownership is updated by promoting the replica to the primary in the existing shard addresses.
+    /// 3. **Slot Migration**: If the new primary is an existing primary in another shard, this indicates a slot migration,
+    ///    and the slot mapping is updated to point to the new shard addresses.
+    /// 4. **Replica Moved to a Different Shard**: If the new primary is a replica in a different shard, it can be due to:
     ///    - The replica became the primary of its shard after a failover, with new slots migrated to it.
     ///    - The replica has moved to a different shard as the primary.
-    ///      Information about the new shard—whether it’s the original shard or a new one
-    ///      with different slots and nodes—is unknown.
-    /// 5. **New Node**: If moved to an unknown node, this suggests the addition of a new node and possible scale-out.
+    ///      Since further information is unknown, the replica is removed from its original shard and added as the primary of a new shard.
+    /// 5. **New Node**: If the new primary is unknown, it is added as a new node in a new shard, possibly indicating scale-out.
     ///
     /// # Arguments
     /// * `inner` - Shared reference to InnerCore containing connection and slot state.
@@ -1732,7 +1733,6 @@ where
     ) -> RedisResult<()> {
         let connections_container = inner.conn_lock.read().await;
         let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
-        println!("before={}", connections_container.slot_map);
 
         // Check if the new primary is already a part of the current shard nodes
         if let Some(curr_shard_addrs) = curr_shard_addrs {
@@ -1740,14 +1740,12 @@ where
                 .read()
                 .expect("Failed to acquire read lock for ShardAddrs");
             if *curr_shard_addrs_read.primary() == *new_primary {
-                println!("Scenario 1");
-                // Scenario 1: No change needed if the new primary is already recognized as the slot owner.
+                // Scenario 1: No Change - The new primary is already the current slot owner.
                 return Ok(());
             }
 
             if curr_shard_addrs_read.replicas().contains(&new_primary) {
-                // Scenario 2: Handle failover within the same shard by updating all slots managed by the old primary to the new primary.
-                println!("Scenario 2");
+                // Scenario 2: Failover - The new primary is a replica within the same shard
                 drop(curr_shard_addrs_read);
                 let mut curr_shard_addrs_write = curr_shard_addrs
                     .write()
@@ -1755,7 +1753,8 @@ where
                 return curr_shard_addrs_write.promote_replica_to_primary(new_primary);
             }
         }
-        // Scenario 3 and 4: Check if the node exists in other shards
+
+        // Scenario 3 & 4: Check if the new primary exists in other shards
         let mut nodes_iter = connections_container.slot_map_nodes();
         for (node_addr, shard_addrs_arc) in &mut nodes_iter {
             if node_addr == new_primary {
@@ -1767,9 +1766,8 @@ where
                     is_existing_primary = *shard_addrs.primary() == *new_primary;
                 }
                 if is_existing_primary {
-                    // Scenario 3: Slot migration to an existing primary in another shard.
+                    // Scenario 3: Slot Migration - The new primary is an existing primary in another shard
                     // Update the associated addresses for `slot` to `shard_addrs`.
-                    println!("Scenario 3");
                     drop(nodes_iter);
                     drop(connections_container);
                     let mut connections_container = inner.conn_lock.write().await;
@@ -1777,16 +1775,13 @@ where
                         .slot_map
                         .update_slot_range(slot, shard_addrs_arc.clone());
                 } else {
-                    println!("Scenario 4");
                     // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn’t own `slot`.
                     // Remove the replica from its existing shard and treat it as a new node in a new shard.
                     {
                         let mut prev_shard_addrs = shard_addrs_arc
                             .write()
                             .expect("Failed to acquire write lock for ShardAddrs");
-                        if let Err(err) = prev_shard_addrs.remove_replica(new_primary.clone()) {
-                            warn!("Failed to remove node {new_primary:?} from previous shard: {prev_shard_addrs:?}.\nError: {err:?}");
-                        }
+                        prev_shard_addrs.remove_replica(new_primary.clone())?;
                     }
                     drop(nodes_iter);
                     drop(connections_container);
@@ -1798,8 +1793,7 @@ where
             }
         }
 
-        // Scenario 5: `new_primary` isn’t present in the current slots map. Add it as a new node in a new shard.
-        println!("Scenario 5");
+        // Scenario 5: New Node - The new primary is not present in the current slots map, add it as a primary of a new shard.
         drop(nodes_iter);
         drop(connections_container);
         let mut connections_container = inner.conn_lock.write().await;
@@ -1938,7 +1932,6 @@ where
         let (address, mut conn) = Self::get_connection(routing, core, Some(cmd.clone()))
             .await
             .map_err(|err| (OperationTarget::NotFound, err))?;
-        println!("recieved connection for {address:?}");
         conn.req_packed_command(&cmd)
             .await
             .map(Response::Single)
@@ -2235,9 +2228,6 @@ where
                     let future: Option<
                         RequestState<Pin<Box<dyn Future<Output = OperationResult> + Send>>>,
                     > = if let Some(moved_redirect) = moved_redirect {
-                        println!(
-                            "moved_redirect is found, adding future to update_upon_moved_error"
-                        );
                         Some(RequestState::UpdateMoved {
                             future: Box::pin(ClusterConnInner::update_upon_moved_error(
                                 self.inner.clone(),
