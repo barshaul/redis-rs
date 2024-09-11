@@ -1736,21 +1736,17 @@ where
 
         // Check if the new primary is already a part of the current shard nodes
         if let Some(curr_shard_addrs) = curr_shard_addrs {
-            let curr_shard_addrs_read = curr_shard_addrs
-                .read()
+            let mut curr_shard_addrs = curr_shard_addrs
+                .write()
                 .expect("Failed to acquire read lock for ShardAddrs");
-            if *curr_shard_addrs_read.primary() == *new_primary {
+            if *curr_shard_addrs.primary() == *new_primary {
                 // Scenario 1: No Change - The new primary is already the current slot owner.
                 return Ok(());
             }
 
-            if curr_shard_addrs_read.replicas().contains(&new_primary) {
+            if curr_shard_addrs.replicas().contains(&new_primary) {
                 // Scenario 2: Failover - The new primary is a replica within the same shard
-                drop(curr_shard_addrs_read);
-                let mut curr_shard_addrs_write = curr_shard_addrs
-                    .write()
-                    .expect("Failed to acquire write lock for ShardAddrs");
-                return curr_shard_addrs_write.promote_replica_to_primary(new_primary);
+                return curr_shard_addrs.promote_replica_to_primary(new_primary);
             }
         }
 
@@ -1758,18 +1754,14 @@ where
         let mut nodes_iter = connections_container.slot_map_nodes();
         for (node_addr, shard_addrs_arc) in &mut nodes_iter {
             if node_addr == new_primary {
-                let is_existing_primary;
-                {
-                    let shard_addrs = shard_addrs_arc
-                        .read()
-                        .expect("Failed to acquire read lock for ShardAddrs");
-                    is_existing_primary = *shard_addrs.primary() == *new_primary;
-                }
+                let is_existing_primary = shard_addrs_arc
+                    .read()
+                    .expect("Failed to acquire read lock for ShardAddrs")
+                    .primary()
+                    .eq(&new_primary);
                 if is_existing_primary {
                     // Scenario 3: Slot Migration - The new primary is an existing primary in another shard
                     // Update the associated addresses for `slot` to `shard_addrs`.
-                    drop(nodes_iter);
-                    drop(connections_container);
                     let mut connections_container = inner.conn_lock.write().await;
                     return connections_container
                         .slot_map
@@ -1777,14 +1769,10 @@ where
                 } else {
                     // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn’t own `slot`.
                     // Remove the replica from its existing shard and treat it as a new node in a new shard.
-                    {
-                        let mut prev_shard_addrs = shard_addrs_arc
-                            .write()
-                            .expect("Failed to acquire write lock for ShardAddrs");
-                        prev_shard_addrs.remove_replica(new_primary.clone())?;
-                    }
-                    drop(nodes_iter);
-                    drop(connections_container);
+                    shard_addrs_arc
+                        .write()
+                        .expect("Failed to acquire write lock for ShardAddrs")
+                        .remove_replica(new_primary.clone())?;
                     let mut connections_container = inner.conn_lock.write().await;
                     return connections_container
                         .slot_map
@@ -1794,8 +1782,6 @@ where
         }
 
         // Scenario 5: New Node - The new primary is not present in the current slots map, add it as a primary of a new shard.
-        drop(nodes_iter);
-        drop(connections_container);
         let mut connections_container = inner.conn_lock.write().await;
         connections_container
             .slot_map
