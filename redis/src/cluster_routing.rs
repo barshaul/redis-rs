@@ -908,6 +908,8 @@ pub(crate) enum ShardUpdateResult {
     NodeNotFound,
 }
 
+const READ_LK_ERR_SHARDADDRS: &str = "Failed to acquire read lock for ShardAddrs";
+const WRITE_LK_ERR_SHARDADDRS: &str = "Failed to acquire write lock for ShardAddrs";
 /// This is just a simplified version of [`Slot`],
 /// which stores only the master and [optional] replica
 /// to avoid the need to choose a replica each time
@@ -920,23 +922,11 @@ pub(crate) struct ShardAddrs {
 
 impl PartialEq for ShardAddrs {
     fn eq(&self, other: &Self) -> bool {
-        let self_primary = self
-            .primary
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs");
-        let other_primary = other
-            .primary
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs");
+        let self_primary = self.primary.read().expect(READ_LK_ERR_SHARDADDRS);
+        let other_primary = other.primary.read().expect(READ_LK_ERR_SHARDADDRS);
 
-        let self_replicas = self
-            .replicas
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs");
-        let other_replicas = other
-            .replicas
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs");
+        let self_replicas = self.replicas.read().expect(READ_LK_ERR_SHARDADDRS);
+        let other_replicas = other.replicas.read().expect(READ_LK_ERR_SHARDADDRS);
 
         *self_primary == *other_primary && *self_replicas == *other_replicas
     }
@@ -952,25 +942,13 @@ impl PartialOrd for ShardAddrs {
 
 impl Ord for ShardAddrs {
     fn cmp(&self, other: &Self) -> Ordering {
-        let self_primary = self
-            .primary
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs");
-        let other_primary = other
-            .primary
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs");
+        let self_primary = self.primary.read().expect(READ_LK_ERR_SHARDADDRS);
+        let other_primary = other.primary.read().expect(READ_LK_ERR_SHARDADDRS);
 
         let primary_cmp = self_primary.cmp(&other_primary);
         if primary_cmp == Ordering::Equal {
-            let self_replicas = self
-                .replicas
-                .read()
-                .expect("Failed to acquire lock on ShardAddrs");
-            let other_replicas = other
-                .replicas
-                .read()
-                .expect("Failed to acquire lock on ShardAddrs");
+            let self_replicas = self.replicas.read().expect(READ_LK_ERR_SHARDADDRS);
+            let other_replicas = other.replicas.read().expect(READ_LK_ERR_SHARDADDRS);
             return self_replicas.cmp(&other_replicas);
         }
 
@@ -986,20 +964,15 @@ impl ShardAddrs {
     }
 
     pub(crate) fn new_with_primary(primary: Arc<String>) -> Self {
-        Self::new(primary, Vec::new())
+        Self::new(primary, Vec::default())
     }
 
     pub(crate) fn primary(&self) -> Arc<String> {
-        self.primary
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs")
-            .clone()
+        self.primary.read().expect(READ_LK_ERR_SHARDADDRS).clone()
     }
 
     pub(crate) fn replicas(&self) -> std::sync::RwLockReadGuard<Vec<Arc<String>>> {
-        self.replicas
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs")
+        self.replicas.read().expect(READ_LK_ERR_SHARDADDRS)
     }
 
     /// Attempts to update the shard roles based on the provided `new_primary`.
@@ -1025,14 +998,8 @@ impl ShardAddrs {
     /// # Returns:
     /// * `ShardUpdateResult` - The result of the role update operation.
     pub(crate) fn attempt_shard_role_update(&self, new_primary: Arc<String>) -> ShardUpdateResult {
-        let mut primary_lock = self
-            .primary
-            .write()
-            .expect("Failed to acquire lock on ShardAddrs");
-        let mut replicas_lock = self
-            .replicas
-            .write()
-            .expect("Failed to acquire lock on ShardAddrs");
+        let mut primary_lock = self.primary.write().expect(WRITE_LK_ERR_SHARDADDRS);
+        let mut replicas_lock = self.replicas.write().expect(WRITE_LK_ERR_SHARDADDRS);
 
         // If the new primary is already the current primary, return early.
         if *primary_lock == new_primary {
@@ -1069,10 +1036,7 @@ impl ShardAddrs {
     /// * `RedisResult<()>` - `Ok(())` if the replica was successfully removed, or an error if the
     ///   replica was not found.
     pub(crate) fn remove_replica(&self, replica_to_remove: Arc<String>) -> RedisResult<()> {
-        let mut replicas_lock = self
-            .replicas
-            .write()
-            .expect("Failed to acquire lock on ShardAddrs");
+        let mut replicas_lock = self.replicas.write().expect(WRITE_LK_ERR_SHARDADDRS);
         if let Some(index) = Self::replica_index(&replicas_lock, replica_to_remove.clone()) {
             replicas_lock.remove(index);
             Ok(())
@@ -1091,16 +1055,8 @@ impl<'a> IntoIterator for &'a ShardAddrs {
     type IntoIter = std::iter::Chain<Once<Arc<String>>, std::vec::IntoIter<Arc<String>>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let primary = self
-            .primary
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs")
-            .clone();
-        let replicas = self
-            .replicas
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs")
-            .clone();
+        let primary = self.primary.read().expect(READ_LK_ERR_SHARDADDRS).clone();
+        let replicas = self.replicas.read().expect(READ_LK_ERR_SHARDADDRS).clone();
 
         std::iter::once(primary).chain(replicas)
     }

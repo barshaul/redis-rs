@@ -635,9 +635,7 @@ pub(crate) struct RedirectNode {
 }
 
 impl RedirectNode {
-    /// This function expects an `Option` containing a tuple with a string slice and a u16.
-    /// The tuple represents an address and a slot, respectively. If the input is `Some`,
-    /// the function converts the address to a `String` and constructs a `RedirectNode`.
+    /// Constructs a `RedirectNode` from an optional tuple containing an address and a slot number.
     pub(crate) fn from_option_tuple(option: Option<(&str, u16)>) -> Option<Self> {
         option.map(|(address, slot)| RedirectNode {
             address: address.to_string(),
@@ -828,8 +826,8 @@ impl<C> Future for Request<C> {
                     // Updating the slot map based on the MOVED error is an optimization.
                     // If it fails, proceed by retrying the request with the redirected node,
                     // and allow the slot refresh task to correct the slot map.
-                    warn!(
-                        "Failed to update the slot map based on the received MOVED error.\n
+                    info!(
+                        "Failed to update the slot map based on the received MOVED error.
                         Error: {err:?}"
                     );
                 }
@@ -1739,7 +1737,7 @@ where
                 // Scenario 1: No changes needed as the new primary is already the current slot owner.
                 // Scenario 2: Failover occurred and the new primary was promoted from a replica.
                 ShardUpdateResult::AlreadyPrimary | ShardUpdateResult::Promoted => return Ok(()),
-                // If the node was not found, proceed with further scenarios.
+                // The node was not found in this shard, proceed with further scenarios.
                 ShardUpdateResult::NodeNotFound => {}
             }
         }
