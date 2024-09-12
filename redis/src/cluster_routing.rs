@@ -7,7 +7,7 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::iter::Once;
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockWriteGuard};
 
 #[derive(Clone)]
 pub(crate) enum Redirect {
@@ -1040,7 +1040,7 @@ impl ShardAddrs {
         }
 
         // If the new primary is found among replicas, swap it with the current primary.
-        if let Some(replica_idx) = self.replica_index(new_primary.clone()) {
+        if let Some(replica_idx) = Self::replica_index(&replicas_lock, new_primary.clone()) {
             std::mem::swap(&mut *primary_lock, &mut replicas_lock[replica_idx]);
             return ShardUpdateResult::Promoted;
         }
@@ -1049,10 +1049,11 @@ impl ShardAddrs {
         ShardUpdateResult::NodeNotFound
     }
 
-    fn replica_index(&self, target_replica: Arc<String>) -> Option<usize> {
-        self.replicas
-            .read()
-            .expect("Failed to acquire lock on ShardAddrs")
+    fn replica_index(
+        replicas: &RwLockWriteGuard<'_, Vec<Arc<String>>>,
+        target_replica: Arc<String>,
+    ) -> Option<usize> {
+        replicas
             .iter()
             .position(|curr_replica| **curr_replica == *target_replica)
     }
@@ -1068,11 +1069,12 @@ impl ShardAddrs {
     /// * `RedisResult<()>` - `Ok(())` if the replica was successfully removed, or an error if the
     ///   replica was not found.
     pub(crate) fn remove_replica(&self, replica_to_remove: Arc<String>) -> RedisResult<()> {
-        if let Some(index) = self.replica_index(replica_to_remove.clone()) {
-            self.replicas
-                .write()
-                .expect("Failed to acquire lock on ShardAddrs")
-                .remove(index);
+        let mut replicas_lock = self
+            .replicas
+            .write()
+            .expect("Failed to acquire lock on ShardAddrs");
+        if let Some(index) = Self::replica_index(&replicas_lock, replica_to_remove.clone()) {
+            replicas_lock.remove(index);
             Ok(())
         } else {
             Err(RedisError::from((

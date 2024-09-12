@@ -1731,7 +1731,7 @@ where
         slot: u16,
         new_primary: Arc<String>,
     ) -> RedisResult<()> {
-        let connections_container = inner.conn_lock.read().await;
+        let mut connections_container = inner.conn_lock.write().await;
         let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
         // Check if the new primary is part of the current shard and update if required
         if let Some(curr_shard_addrs) = curr_shard_addrs {
@@ -1744,9 +1744,6 @@ where
             }
         }
 
-        // Further changes are needed, acquire the write lock on the connection container
-        drop(connections_container);
-        let mut connections_container = inner.conn_lock.write().await;
         // Scenario 3 & 4: Check if the new primary exists in other shards
         let mut nodes_iter = connections_container.slot_map_nodes();
         for (node_addr, shard_addrs_arc) in &mut nodes_iter {
