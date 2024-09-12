@@ -30,7 +30,7 @@ pub mod testing {
     pub use super::connections_logic::*;
 }
 use crate::{
-    cluster_routing::{Routable, RoutingInfo},
+    cluster_routing::{Routable, RoutingInfo, ShardUpdateResult},
     cluster_slotmap::SlotMap,
     cluster_topology::SLOT_SIZE,
     cmd,
@@ -1733,47 +1733,37 @@ where
     ) -> RedisResult<()> {
         let connections_container = inner.conn_lock.read().await;
         let curr_shard_addrs = connections_container.slot_map.shard_addrs_for_slot(slot);
-
-        // Check if the new primary is already a part of the current shard nodes
+        // Check if the new primary is part of the current shard and update if required
         if let Some(curr_shard_addrs) = curr_shard_addrs {
-            let mut curr_shard_addrs = curr_shard_addrs
-                .write()
-                .expect("Failed to acquire read lock for ShardAddrs");
-            if *curr_shard_addrs.primary() == *new_primary {
-                // Scenario 1: No Change - The new primary is already the current slot owner.
-                return Ok(());
-            }
-
-            if curr_shard_addrs.replicas().contains(&new_primary) {
-                // Scenario 2: Failover - The new primary is a replica within the same shard
-                return curr_shard_addrs.promote_replica_to_primary(new_primary);
+            match curr_shard_addrs.attempt_shard_role_update(new_primary.clone()) {
+                // Scenario 1: No changes needed as the new primary is already the current slot owner.
+                // Scenario 2: Failover occurred and the new primary was promoted from a replica.
+                ShardUpdateResult::AlreadyPrimary | ShardUpdateResult::Promoted => return Ok(()),
+                // If the node was not found, proceed with further scenarios.
+                ShardUpdateResult::NodeNotFound => {}
             }
         }
 
+        // Further changes are needed, acquire the write lock on the connection container
+        drop(connections_container);
+        let mut connections_container = inner.conn_lock.write().await;
         // Scenario 3 & 4: Check if the new primary exists in other shards
         let mut nodes_iter = connections_container.slot_map_nodes();
         for (node_addr, shard_addrs_arc) in &mut nodes_iter {
             if node_addr == new_primary {
-                let is_existing_primary = shard_addrs_arc
-                    .read()
-                    .expect("Failed to acquire read lock for ShardAddrs")
-                    .primary()
-                    .eq(&new_primary);
+                let is_existing_primary = shard_addrs_arc.primary().eq(&new_primary);
                 if is_existing_primary {
                     // Scenario 3: Slot Migration - The new primary is an existing primary in another shard
                     // Update the associated addresses for `slot` to `shard_addrs`.
-                    let mut connections_container = inner.conn_lock.write().await;
+                    drop(nodes_iter);
                     return connections_container
                         .slot_map
                         .update_slot_range(slot, shard_addrs_arc.clone());
                 } else {
                     // Scenario 4: The MOVED error redirects to `new_primary` which is known as a replica in a shard that doesn’t own `slot`.
                     // Remove the replica from its existing shard and treat it as a new node in a new shard.
-                    shard_addrs_arc
-                        .write()
-                        .expect("Failed to acquire write lock for ShardAddrs")
-                        .remove_replica(new_primary.clone())?;
-                    let mut connections_container = inner.conn_lock.write().await;
+                    shard_addrs_arc.remove_replica(new_primary.clone())?;
+                    drop(nodes_iter);
                     return connections_container
                         .slot_map
                         .add_new_primary(slot, new_primary);
@@ -1782,7 +1772,7 @@ where
         }
 
         // Scenario 5: New Node - The new primary is not present in the current slots map, add it as a primary of a new shard.
-        let mut connections_container = inner.conn_lock.write().await;
+        drop(nodes_iter);
         connections_container
             .slot_map
             .add_new_primary(slot, new_primary)
