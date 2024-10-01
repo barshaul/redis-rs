@@ -823,6 +823,7 @@ enum Next<C> {
         // if not set, then a reconnect should happen without sending a request afterwards
         request: Option<PendingRequest<C>>,
         target: String,
+        should_retry: bool,
     },
     RefreshSlots {
         // if not set, then a slot refresh should happen without sending a request afterwards
@@ -866,6 +867,7 @@ impl<C> Future for Request<C> {
                 let request = this.request.as_mut().unwrap();
                 // TODO - would be nice if we didn't need to repeat this code twice, with & without retries.
                 if request.retry >= this.retry_params.number_of_retries {
+                    let retry_method = err.retry_method();
                     let next = if err.kind() == ErrorKind::AllConnectionsUnavailable {
                         Next::ReconnectToInitialNodes { request: None }.into()
                     } else if matches!(err.retry_method(), crate::types::RetryMethod::MovedRedirect)
@@ -876,11 +878,18 @@ impl<C> Future for Request<C> {
                             sleep_duration: None,
                         }
                         .into()
-                    } else if matches!(err.retry_method(), crate::types::RetryMethod::Reconnect) {
+                    } else if matches!(retry_method, crate::types::RetryMethod::Reconnect)
+                        || matches!(retry_method, crate::types::RetryMethod::ReconnectAndRetry)
+                    {
                         if let OperationTarget::Node { address } = target {
+                            let should_retry = matches!(
+                                retry_method,
+                                crate::types::RetryMethod::ReconnectAndRetry
+                            );
                             Next::Reconnect {
                                 request: None,
                                 target: address,
+                                should_retry,
                             }
                             .into()
                         } else {
@@ -955,14 +964,20 @@ impl<C> Future for Request<C> {
                         });
                         self.poll(cx)
                     }
-                    crate::types::RetryMethod::Reconnect => {
+                    crate::types::RetryMethod::Reconnect
+                    | crate::types::RetryMethod::ReconnectAndRetry => {
                         let mut request = this.request.take().unwrap();
                         // TODO should we reset the redirect here?
                         request.info.reset_routing();
                         warn!("disconnected from {:?}", address);
+                        let should_retry = matches!(
+                            err.retry_method(),
+                            crate::types::RetryMethod::ReconnectAndRetry
+                        );
                         Next::Reconnect {
                             request: Some(request),
                             target: address,
+                            should_retry,
                         }
                         .into()
                     }
@@ -1207,8 +1222,11 @@ where
         Ok(connections.0)
     }
 
-    fn reconnect_to_initial_nodes(&mut self) -> impl Future<Output = ()> {
-        let inner = self.inner.clone();
+    // Reconnet to the initial nodes provided by the user in the creation of the client,
+    // and try to refresh the slots based on the initial connections.
+    // Being used when all cluster connections are unavailable.
+    fn reconnect_to_initial_nodes(inner: Arc<InnerCore<C>>) -> impl Future<Output = ()> {
+        let inner = inner.clone();
         async move {
             let connection_map = match Self::create_initial_connections(
                 &inner.initial_nodes,
@@ -1714,7 +1732,9 @@ where
         Self::refresh_slots_inner(inner, curr_retry)
             .await
             .map_err(|err| {
-                if curr_retry > DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES {
+                if curr_retry > DEFAULT_NUMBER_OF_REFRESH_SLOTS_RETRIES
+                    || err.kind() == ErrorKind::AllConnectionsUnavailable
+                {
                     BackoffError::Permanent(err)
                 } else {
                     BackoffError::from(err)
@@ -1823,7 +1843,6 @@ where
         core: Core<C>,
         response_policy: Option<ResponsePolicy>,
     ) -> OperationResult {
-        trace!("execute_on_multiple_nodes");
         let connections_container = core.conn_lock.read().await;
         if connections_container.is_empty() {
             return OperationResult::Err((
@@ -2107,14 +2126,20 @@ where
             }
             ConnectionCheck::RandomConnection => {
                 let read_guard = core.conn_lock.read().await;
-                let (random_address, random_conn_future) = read_guard
-                    .random_connections(1, ConnectionType::User)
-                    .next()
-                    .ok_or(RedisError::from((
+                let random_conns_option = read_guard.random_connections(1, ConnectionType::User);
+                if let Some(mut random_connections) = random_conns_option {
+                    let (random_address, random_conn_future) =
+                        random_connections.next().ok_or(RedisError::from((
+                            ErrorKind::AllConnectionsUnavailable,
+                            "No random connection found",
+                        )))?;
+                    return Ok((random_address, random_conn_future.await));
+                } else {
+                    return Err(RedisError::from((
                         ErrorKind::AllConnectionsUnavailable,
                         "No random connection found",
-                    )))?;
-                return Ok((random_address, random_conn_future.await));
+                    )));
+                }
             }
         };
 
@@ -2129,29 +2154,42 @@ where
             ConnectionState::PollComplete => return Poll::Ready(Ok(())),
             ConnectionState::Recover(future) => future,
         };
-        match recover_future {
+        let (next_state, poll) = match recover_future {
             RecoverFuture::RecoverSlots(ref mut future) => match ready!(future.as_mut().poll(cx)) {
                 Ok(_) => {
                     trace!("Recovered!");
-                    self.state = ConnectionState::PollComplete;
-                    Poll::Ready(Ok(()))
+                    (Some(ConnectionState::PollComplete), Poll::Ready(Ok(())))
                 }
                 Err(err) => {
                     trace!("Recover slots failed!");
-                    *future = Box::pin(Self::refresh_slots_and_subscriptions_with_retries(
-                        self.inner.clone(),
-                        &RefreshPolicy::Throttable,
-                    ));
-                    Poll::Ready(Err(err))
+
+                    let next_state = if err.kind() == ErrorKind::AllConnectionsUnavailable {
+                        Some(ConnectionState::Recover(RecoverFuture::Reconnect(
+                            Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
+                                self.inner.clone(),
+                            )),
+                        )))
+                    } else {
+                        Some(ConnectionState::Recover(RecoverFuture::RecoverSlots(
+                            Box::pin(Self::refresh_slots_and_subscriptions_with_retries(
+                                self.inner.clone(),
+                                &RefreshPolicy::Throttable,
+                            )),
+                        )))
+                    };
+                    (next_state, Poll::Ready(Err(err)))
                 }
             },
             RecoverFuture::Reconnect(ref mut future) => {
                 ready!(future.as_mut().poll(cx));
                 trace!("Reconnected connections");
-                self.state = ConnectionState::PollComplete;
-                Poll::Ready(Ok(()))
+                (Some(ConnectionState::PollComplete), Poll::Ready(Ok(())))
             }
+        };
+        if let Some(state) = next_state {
+            self.state = state;
         }
+        poll
     }
 
     async fn handle_loading_error(
@@ -2261,12 +2299,16 @@ where
                     }
                 }
                 Next::Reconnect {
-                    request, target, ..
+                    request,
+                    target,
+                    should_retry,
                 } => {
                     poll_flush_action =
                         poll_flush_action.change_state(PollFlushAction::Reconnect(vec![target]));
                     if let Some(request) = request {
-                        self.inner.pending_requests.lock().unwrap().push(request);
+                        if should_retry {
+                            self.inner.pending_requests.lock().unwrap().push(request);
+                        }
                     }
                 }
                 Next::ReconnectToInitialNodes { request } => {
@@ -2405,7 +2447,7 @@ where
                 }
                 PollFlushAction::ReconnectFromInitialConnections => {
                     self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
-                        self.reconnect_to_initial_nodes(),
+                        ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
                     )));
                 }
             }
@@ -2447,8 +2489,20 @@ async fn calculate_topology_from_random_nodes<'a, C>(
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
-    let requested_nodes =
-        read_guard.random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement);
+    let requested_nodes = match read_guard
+        .random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement)
+    {
+        Some(random_conns) => random_conns,
+        None => {
+            return (
+                Err(RedisError::from((
+                    ErrorKind::AllConnectionsUnavailable,
+                    "No available connections to refresh slots from",
+                ))),
+                vec![],
+            )
+        }
+    };
     let topology_join_results =
         futures::future::join_all(requested_nodes.map(|(addr, conn)| async move {
             let mut conn: C = conn.await;

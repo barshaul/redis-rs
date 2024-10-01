@@ -255,16 +255,22 @@ where
         &self,
         amount: usize,
         conn_type: ConnectionType,
-    ) -> impl Iterator<Item = ConnectionAndAddress<Connection>> + '_ {
-        self.connection_map
-            .iter()
-            .choose_multiple(&mut rand::thread_rng(), amount)
-            .into_iter()
-            .map(move |item| {
-                let (address, node) = (item.key(), item.value());
-                let conn = node.get_connection(&conn_type);
-                (address.clone(), conn)
-            })
+    ) -> Option<impl Iterator<Item = ConnectionAndAddress<Connection>> + '_> {
+        if self.connection_map.is_empty() {
+            None
+        } else {
+            Some(
+                self.connection_map
+                    .iter()
+                    .choose_multiple(&mut rand::thread_rng(), amount)
+                    .into_iter()
+                    .map(move |item| {
+                        let (address, node) = (item.key(), item.value());
+                        let conn = node.get_connection(&conn_type);
+                        (address.clone(), conn)
+                    }),
+            )
+        }
     }
 
     pub(crate) fn replace_or_add_connection_for_address(
@@ -633,6 +639,7 @@ mod tests {
 
         let random_connections: HashSet<_> = container
             .random_connections(3, ConnectionType::User)
+            .expect("No connections found")
             .map(|pair| pair.1)
             .collect();
 
@@ -651,6 +658,7 @@ mod tests {
             0,
             container
                 .random_connections(1, ConnectionType::User)
+                .expect("No connections found")
                 .count()
         );
     }
@@ -665,6 +673,7 @@ mod tests {
         );
         let random_connections: Vec<_> = container
             .random_connections(1, ConnectionType::User)
+            .expect("No connections found")
             .collect();
 
         assert_eq!(vec![(address, 4)], random_connections);
@@ -675,6 +684,7 @@ mod tests {
         let container = create_container();
         let mut random_connections: Vec<_> = container
             .random_connections(1000, ConnectionType::User)
+            .expect("No connections found")
             .map(|pair| pair.1)
             .collect();
         random_connections.sort();
@@ -687,6 +697,7 @@ mod tests {
         let container = create_container_with_strategy(ReadFromReplicaStrategy::RoundRobin, true);
         let mut random_connections: Vec<_> = container
             .random_connections(1000, ConnectionType::PreferManagement)
+            .expect("No connections found")
             .map(|pair| pair.1)
             .collect();
         random_connections.sort();
