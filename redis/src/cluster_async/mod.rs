@@ -1310,30 +1310,25 @@ where
             let inner = inner.clone();
 
             tasks.push(async move {
-                let connections_container = inner.conn_lock.read().await;
-                let cluster_params = &inner.cluster_params;
-                let subscriptions_by_address = &inner.subscriptions_by_address;
-                let glide_connection_options = &inner.glide_connection_options;
-
                 let node_option = if check_existing_conn {
+                    let connections_container = inner.conn_lock.read().await;
                     connections_container.remove_node(&address)
                 } else {
                     None
                 };
 
                 // Override subscriptions for this connection
-                let mut cluster_params = cluster_params.clone();
-                let subs_guard = subscriptions_by_address.read().await;
+                let mut cluster_params = inner.cluster_params.clone();
+                let subs_guard = inner.subscriptions_by_address.read().await;
                 cluster_params.pubsub_subscriptions = subs_guard.get(&address).cloned();
                 drop(subs_guard);
-                drop(connections_container);
 
                 let node = get_or_create_conn(
                     &address,
                     node_option,
                     &cluster_params,
                     conn_type,
-                    glide_connection_options.clone(),
+                    inner.glide_connection_options.clone(),
                 )
                 .await;
 
@@ -1356,7 +1351,7 @@ where
                 }
             }
         }
-        info!("refresh connections completed");
+        debug!("refresh connections completed");
     }
 
     async fn aggregate_results(
