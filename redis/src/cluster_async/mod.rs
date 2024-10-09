@@ -823,7 +823,6 @@ enum Next<C> {
         // if not set, then a reconnect should happen without sending a request afterwards
         request: Option<PendingRequest<C>>,
         target: String,
-        should_retry: bool,
     },
     RefreshSlots {
         // if not set, then a slot refresh should happen without sending a request afterwards
@@ -882,14 +881,9 @@ impl<C> Future for Request<C> {
                         || matches!(retry_method, crate::types::RetryMethod::ReconnectAndRetry)
                     {
                         if let OperationTarget::Node { address } = target {
-                            let should_retry = matches!(
-                                retry_method,
-                                crate::types::RetryMethod::ReconnectAndRetry
-                            );
                             Next::Reconnect {
                                 request: None,
                                 target: address,
-                                should_retry,
                             }
                             .into()
                         } else {
@@ -975,9 +969,8 @@ impl<C> Future for Request<C> {
                             crate::types::RetryMethod::ReconnectAndRetry
                         );
                         Next::Reconnect {
-                            request: Some(request),
+                            request: should_retry.then_some(request),
                             target: address,
-                            should_retry,
                         }
                         .into()
                     }
@@ -2298,17 +2291,11 @@ where
                         }));
                     }
                 }
-                Next::Reconnect {
-                    request,
-                    target,
-                    should_retry,
-                } => {
+                Next::Reconnect { request, target } => {
                     poll_flush_action =
                         poll_flush_action.change_state(PollFlushAction::Reconnect(vec![target]));
                     if let Some(request) = request {
-                        if should_retry {
-                            self.inner.pending_requests.lock().unwrap().push(request);
-                        }
+                        self.inner.pending_requests.lock().unwrap().push(request);
                     }
                 }
                 Next::ReconnectToInitialNodes { request } => {

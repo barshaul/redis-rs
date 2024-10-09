@@ -256,21 +256,17 @@ where
         amount: usize,
         conn_type: ConnectionType,
     ) -> Option<impl Iterator<Item = ConnectionAndAddress<Connection>> + '_> {
-        if self.connection_map.is_empty() {
-            None
-        } else {
-            Some(
-                self.connection_map
-                    .iter()
-                    .choose_multiple(&mut rand::thread_rng(), amount)
-                    .into_iter()
-                    .map(move |item| {
-                        let (address, node) = (item.key(), item.value());
-                        let conn = node.get_connection(&conn_type);
-                        (address.clone(), conn)
-                    }),
-            )
-        }
+        (!self.connection_map.is_empty()).then(|| {
+            self.connection_map
+                .iter()
+                .choose_multiple(&mut rand::thread_rng(), amount)
+                .into_iter()
+                .map(move |item| {
+                    let (address, node) = (item.key(), item.value());
+                    let conn = node.get_connection(&conn_type);
+                    (address.clone(), conn)
+                })
+        })
     }
 
     pub(crate) fn replace_or_add_connection_for_address(
