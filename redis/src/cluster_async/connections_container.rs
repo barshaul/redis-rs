@@ -654,13 +654,9 @@ mod tests {
         let container = create_container();
         remove_all_connections(&container);
 
-        assert_eq!(
-            0,
-            container
-                .random_connections(1, ConnectionType::User)
-                .expect("No connections found")
-                .count()
-        );
+        assert!(container
+            .random_connections(1, ConnectionType::User)
+            .is_none());
     }
 
     #[test]
