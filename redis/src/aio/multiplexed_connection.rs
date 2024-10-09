@@ -370,8 +370,9 @@ where
             })
             .await
             .map_err(|err| {
-                // If an error occurs here, it means the request never reached the server.
-                // Since the server did not receive the data, it is safe to retry the request.
+                // If an error occurs here, it means the request never reached the server, as guaranteed
+                // by the 'send' function. Since the server did not receive the data, it is safe to retry
+                // the request.
                 RedisError::from((
                     crate::ErrorKind::IoErrorRetrySafe,
                     "Failed to send the request to the server",
@@ -384,6 +385,7 @@ where
                 // The `sender` was dropped which likely means that the stream part
                 // failed for one reason or another.
                 // Since we don't know if the server received the request, retrying it isn't safe.
+                // For example, retrying an INCR request could result in double increments.
                 // Hence, we return an IoError instead of an IoErrorRetrySafe.
                 Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
             }

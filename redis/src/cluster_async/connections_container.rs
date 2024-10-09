@@ -256,7 +256,7 @@ where
         amount: usize,
         conn_type: ConnectionType,
     ) -> Option<impl Iterator<Item = ConnectionAndAddress<Connection>> + '_> {
-        (!self.connection_map.is_empty()).then(|| {
+        (!self.connection_map.is_empty()).then_some({
             self.connection_map
                 .iter()
                 .choose_multiple(&mut rand::thread_rng(), amount)
