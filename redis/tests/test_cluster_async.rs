@@ -2584,7 +2584,6 @@ mod cluster_async {
                 respond_startup_two_nodes(name, cmd)?;
                 let i = requests.fetch_add(1, atomic::Ordering::SeqCst);
                 match i {
-                    // Respond that the key exists on a node that does not yet have a connection:
                     0 => Err(Err(RedisError::from((ErrorKind::IoError, "io-error")))),
                     _ => {
                         panic!("Expected not to be retried!")
@@ -3224,7 +3223,7 @@ mod cluster_async {
             };
 
             // wait for new topology discovery
-            let max_requests = 10;
+            let max_requests = 5;
             let mut i = 0;
             let mut cmd = redis::cmd("INFO");
             cmd.arg("SERVER");
@@ -3294,9 +3293,8 @@ mod cluster_async {
             }
 
             if use_sharded {
-                let mut cmd = redis::cmd("SPUBLISH");
                 // validate SPUBLISH
-                let result = cmd
+                let result = redis::cmd("SPUBLISH")
                     .arg("test_channel_?")
                     .arg("test_message")
                     .query_async(&mut publishing_con)

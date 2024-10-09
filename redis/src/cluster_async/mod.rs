@@ -1836,6 +1836,7 @@ where
         core: Core<C>,
         response_policy: Option<ResponsePolicy>,
     ) -> OperationResult {
+        trace!("execute_on_multiple_nodes");
         let connections_container = core.conn_lock.read().await;
         if connections_container.is_empty() {
             return OperationResult::Err((
@@ -2119,20 +2120,22 @@ where
             }
             ConnectionCheck::RandomConnection => {
                 let read_guard = core.conn_lock.read().await;
-                let random_conns_option = read_guard.random_connections(1, ConnectionType::User);
-                if let Some(mut random_connections) = random_conns_option {
-                    let (random_address, random_conn_future) =
-                        random_connections.next().ok_or(RedisError::from((
+                read_guard
+                    .random_connections(1, ConnectionType::User)
+                    .and_then(|mut random_connections| {
+                        random_connections.next().map(
+                            |(random_address, random_conn_future)| async move {
+                                (random_address, random_conn_future.await)
+                            },
+                        )
+                    })
+                    .ok_or_else(|| {
+                        RedisError::from((
                             ErrorKind::AllConnectionsUnavailable,
                             "No random connection found",
-                        )))?;
-                    return Ok((random_address, random_conn_future.await));
-                } else {
-                    return Err(RedisError::from((
-                        ErrorKind::AllConnectionsUnavailable,
-                        "No random connection found",
-                    )));
-                }
+                        ))
+                    })?
+                    .await
             }
         };
 
@@ -2151,23 +2154,21 @@ where
             RecoverFuture::RecoverSlots(ref mut future) => match ready!(future.as_mut().poll(cx)) {
                 Ok(_) => {
                     trace!("Recovered!");
-                    (Some(ConnectionState::PollComplete), Poll::Ready(Ok(())))
+                    (ConnectionState::PollComplete, Poll::Ready(Ok(())))
                 }
                 Err(err) => {
                     trace!("Recover slots failed!");
 
                     let next_state = if err.kind() == ErrorKind::AllConnectionsUnavailable {
-                        Some(ConnectionState::Recover(RecoverFuture::Reconnect(
-                            Box::pin(ClusterConnInner::reconnect_to_initial_nodes(
-                                self.inner.clone(),
-                            )),
+                        ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
+                            ClusterConnInner::reconnect_to_initial_nodes(self.inner.clone()),
                         )))
                     } else {
-                        Some(ConnectionState::Recover(RecoverFuture::RecoverSlots(
-                            Box::pin(Self::refresh_slots_and_subscriptions_with_retries(
+                        ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
+                            Self::refresh_slots_and_subscriptions_with_retries(
                                 self.inner.clone(),
                                 &RefreshPolicy::Throttable,
-                            )),
+                            ),
                         )))
                     };
                     (next_state, Poll::Ready(Err(err)))
@@ -2176,12 +2177,10 @@ where
             RecoverFuture::Reconnect(ref mut future) => {
                 ready!(future.as_mut().poll(cx));
                 trace!("Reconnected connections");
-                (Some(ConnectionState::PollComplete), Poll::Ready(Ok(())))
+                (ConnectionState::PollComplete, Poll::Ready(Ok(())))
             }
         };
-        if let Some(state) = next_state {
-            self.state = state;
-        }
+        self.state = next_state;
         poll
     }
 
@@ -2476,19 +2475,18 @@ async fn calculate_topology_from_random_nodes<'a, C>(
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
-    let requested_nodes = match read_guard
-        .random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement)
+    let requested_nodes = if let Some(random_conns) =
+        read_guard.random_connections(num_of_nodes_to_query, ConnectionType::PreferManagement)
     {
-        Some(random_conns) => random_conns,
-        None => {
-            return (
-                Err(RedisError::from((
-                    ErrorKind::AllConnectionsUnavailable,
-                    "No available connections to refresh slots from",
-                ))),
-                vec![],
-            )
-        }
+        random_conns
+    } else {
+        return (
+            Err(RedisError::from((
+                ErrorKind::AllConnectionsUnavailable,
+                "No available connections to refresh slots from",
+            ))),
+            vec![],
+        );
     };
     let topology_join_results =
         futures::future::join_all(requested_nodes.map(|(addr, conn)| async move {
